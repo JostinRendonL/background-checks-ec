@@ -182,8 +182,8 @@ def _intentar_consulta(page, cedula: str, num: str) -> dict | None:
     Carga la página, resuelve el captcha y envía el formulario.
     Devuelve el resultado o None si el captcha fue rechazado.
     """
-    page.goto(MINISTERIO_URL, wait_until="domcontentloaded", timeout=30_000)
-    page.wait_for_load_state("networkidle", timeout=15_000)
+    page.goto(MINISTERIO_URL, wait_until="domcontentloaded", timeout=60_000)
+    page.wait_for_load_state("networkidle", timeout=30_000)
 
     img_captcha = page.locator(
         "img[src*='Captcha'], img[src*='captcha'], img[src*='kaptcha']"
@@ -226,7 +226,18 @@ def consultar_cedula(cedula: str, max_intentos: int = 4) -> dict:
     """
     # Proxy residencial opcional (para VPS con IP de datacenter bloqueada)
     proxy_url = os.getenv("WEBSHARE_PROXY_URL")  # ej: http://user:pass@host:port
-    proxy_cfg = {"server": proxy_url} if proxy_url else None
+    if proxy_url:
+        from urllib.parse import urlparse
+        _p = urlparse(proxy_url)
+        proxy_cfg = {
+            "server":   f"{_p.scheme}://{_p.hostname}:{_p.port}",
+            "username": _p.username,
+            "password": _p.password,
+        }
+        print(f"[verificador] Usando proxy: {_p.hostname}:{_p.port} user={_p.username}")
+    else:
+        proxy_cfg = None
+        print("[verificador] Sin proxy — conectando directo")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
