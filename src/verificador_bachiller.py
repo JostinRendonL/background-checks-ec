@@ -123,6 +123,7 @@ def _extraer_resultado(page, cedula: str) -> dict:
     if _FRASE_NO_ENCONTRADO_EXACTA in texto_pagina:
         return {
             "cedula":        cedula,
+            "nombre":        None,
             "tiene_titulo":  False,
             "titulo":        None,
             "especialidad":  None,
@@ -165,6 +166,7 @@ def _extraer_resultado(page, cedula: str) -> dict:
 
     return {
         "cedula":       cedula,
+        "nombre":       celdas[2] if len(celdas) > 2 else None,
         "tiene_titulo": True,
         "titulo":       celdas[4] if len(celdas) > 4 else (celdas[0] if celdas else "—"),
         "especialidad": celdas[5] if len(celdas) > 5 else None,
