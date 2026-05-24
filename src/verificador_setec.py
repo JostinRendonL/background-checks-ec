@@ -4,7 +4,13 @@ verificador_setec.py — Consulta certificaciones SETEC (Ministerio de Trabajo)
 Portal: https://portal.trabajo.gob.ec/setec-portal-web/pages/personasCapacitadasOperadores.jsf
 Tecnología: JSF con AJAX parcial (PrimeFaces). Sin CAPTCHA.
 
-Devuelve cursos y horas de formación oficial registradas en el SETEC.
+Flujo real del portal (inspeccionado 2026-05-24):
+  1. Hay un SelectOneMenu PrimeFaces cuyo <select> oculto tiene ID que contiene
+     'cmbSubOcIndependiente_input'. CÉDULA = value "0".
+  2. Al cambiar dispara PrimeFaces.ab() → AJAX que muestra el panel con:
+     - Input texto: id contiene 'txtParametroCapDoc'
+     - Botón Buscar / Cancelar
+  3. Click Buscar → AJAX que muestra tabla de resultados.
 """
 
 from __future__ import annotations
@@ -17,13 +23,10 @@ from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeo
 
 logger = logging.getLogger(__name__)
 
-_URL = (
-    "https://portal.trabajo.gob.ec"
-    "/setec-portal-web/pages/personasCapacitadasOperadores.jsf"
-)
+_URL        = "https://portal.trabajo.gob.ec/setec-portal-web/pages/personasCapacitadasOperadores.jsf"
 _TIMEOUT    = 30_000   # ms para goto
-_AJAX_WAIT  = 15_000   # ms para esperar tabla post-click
-_SLEEP_ANTI = 2.0      # segundos anti-ban antes de interactuar
+_AJAX_WAIT  = 18_000   # ms para esperar panel / tabla post-AJAX
+_SLEEP_INIT = 2.0      # segundos tras goto (anti-ban)
 
 _FRASES_VACIO = [
     "no se encontraron", "no existen registros", "sin registros",
@@ -31,7 +34,6 @@ _FRASES_VACIO = [
     "no se encontró", "lista vacía",
 ]
 
-# Encabezados de tabla a ignorar al extraer filas
 _HEADERS_IGNORAR = {
     "nombre curso / perfil", "nombre curso", "curso", "perfil",
     "número horas", "num horas", "horas", "fecha inicio", "fecha fin",
@@ -49,7 +51,7 @@ async def consultar_setec(cedula: str) -> dict[str, Any]:
         {
             "error":              None | str,
             "tiene_certificados": bool,
-            "detalle_cursos":     str,   # "CURSO A (60h) | CURSO B (40h)" o "Sin registros"
+            "detalle_cursos":     str,
             "total_cursos":       int,
         }
     """
@@ -58,7 +60,7 @@ async def consultar_setec(cedula: str) -> dict[str, Any]:
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context(
+        ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -77,10 +79,7 @@ async def consultar_setec(cedula: str) -> dict[str, Any]:
 # ── Función con page externo (para reutilizar browser) ────────────────────────
 
 async def check_min_trabajo(cedula: str, page: Page) -> dict[str, Any]:
-    """
-    Versión que recibe un page ya abierto.
-    Útil si el caller maneja el ciclo de vida del browser.
-    """
+    """Versión que recibe un page ya abierto."""
     return await _consultar_en_page(cedula, page)
 
 
@@ -88,28 +87,32 @@ async def check_min_trabajo(cedula: str, page: Page) -> dict[str, Any]:
 
 async def _consultar_en_page(cedula: str, page: Page) -> dict[str, Any]:
     try:
+        # 1. Cargar portal
         await page.goto(_URL, wait_until="domcontentloaded", timeout=_TIMEOUT)
-        await asyncio.sleep(_SLEEP_ANTI)
+        await asyncio.sleep(_SLEEP_INIT)
 
-        # 1. Asegurar que el dropdown esté en CÉDULA
+        # 2. Seleccionar tipo "CÉDULA" en el SelectOneMenu de PrimeFaces
         await _seleccionar_cedula(page)
 
-        # 2. Llenar el campo de documento
+        # 3. Esperar que el AJAX muestre el panel con el input de cédula
+        await _esperar_panel_cedula(page)
+
+        # 4. Llenar el campo de cédula
         await _llenar_cedula(page, cedula)
 
-        # 3. Clic en Buscar
+        # 5. Clic en Buscar
         await _clic_buscar(page)
 
-        # 4. Esperar respuesta AJAX
+        # 6. Esperar respuesta AJAX de la tabla
         await _esperar_ajax(page)
 
-        # 5. Comprobar si la página indica "sin resultados"
+        # 7. Comprobar mensaje de sin resultados
         body = (await page.locator("body").inner_text()).lower()
         if any(f in body for f in _FRASES_VACIO):
             logger.info(f"[SETEC] {cedula} → sin registros")
             return _sin_registros()
 
-        # 6. Extraer tabla
+        # 8. Extraer tabla
         cursos = await _extraer_cursos(page)
 
         if cursos:
@@ -130,112 +133,178 @@ async def _consultar_en_page(cedula: str, page: Page) -> dict[str, Any]:
         return _error("Portal MDT: timeout de conexión")
     except Exception as e:
         logger.error(f"[SETEC] Error inesperado para {cedula}: {type(e).__name__}: {e}")
-        return _error(f"Portal MDT inactivo: {type(e).__name__}")
+        return _error(f"Portal MDT inactivo: {type(e).__name__}: {str(e)[:80]}")
 
 
 # ── Helpers de interacción ────────────────────────────────────────────────────
 
 async def _seleccionar_cedula(page: Page) -> None:
-    """Selecciona 'CÉDULA' en el dropdown de tipo de filtro."""
+    """
+    Selecciona 'CÉDULA' (value='0') en el SelectOneMenu PrimeFaces.
+    El <select> oculto tiene ID que contiene 'cmbSubOcIndependiente_input'.
+    Dispara el onchange de PrimeFaces vía evaluate para que el AJAX se ejecute.
+    """
+    # Selector exacto descubierto en inspección DOM (2026-05-24)
     selectores = [
-        "select[id*='filtro']",
-        "select[id*='tipo']",
-        "select[name*='filtro']",
-        "select",           # fallback: primer select de la página
+        "select[id*='cmbSubOcIndependiente_input']",
+        "select[id*='cmbSubOc']",
+        "select",   # fallback amplio
     ]
-    for sel in selectores:
-        loc = page.locator(sel).first
-        if await loc.count() > 0:
-            try:
-                # Intentar por label primero, luego por value
-                for opcion in ("CÉDULA", "Cédula", "CEDULA", "cedula", "1"):
-                    try:
-                        await loc.select_option(label=opcion, timeout=2_000)
-                        return
-                    except Exception:
-                        pass
-                await loc.select_option(value="CEDULA", timeout=2_000)
-                return
-            except Exception:
-                pass  # Ya estaba seleccionado o no aplica
+    for sel_css in selectores:
+        loc = page.locator(sel_css).first
+        if await loc.count() == 0:
+            continue
+        try:
+            # Obtener el ID del select para ejecutar su onchange correctamente
+            sel_id = await loc.get_attribute("id")
+            # 1. Setear el valor a "0" (CÉDULA)
+            await page.evaluate(
+                f"""
+                (function() {{
+                    var sel = document.getElementById('{sel_id}');
+                    if (!sel) return;
+                    sel.value = '0';
+                    var oc = sel.getAttribute('onchange');
+                    if (oc) eval(oc);
+                }})()
+                """
+            )
+            logger.debug(f"[SETEC] select_cedula OK via {sel_css}")
+            return
+        except Exception as exc:
+            logger.debug(f"[SETEC] _seleccionar_cedula {sel_css} falló: {exc}")
+            continue
+
+    # Último intento: select_option de Playwright (puede no disparar PrimeFaces AJAX)
+    try:
+        await page.locator("select").first.select_option(value="0", timeout=3_000)
+    except Exception:
+        pass
+
+
+async def _esperar_panel_cedula(page: Page) -> None:
+    """
+    Espera a que el panel del formulario (con el input de cédula) sea visible
+    después del AJAX disparado por _seleccionar_cedula.
+    """
+    # El input de cédula tiene ID que contiene 'txtParametroCapDoc'
+    try:
+        await page.wait_for_selector(
+            "input[id*='txtParametroCapDoc']",
+            state="visible",
+            timeout=_AJAX_WAIT,
+        )
+        return
+    except PWTimeout:
+        pass
+    # Fallback: networkidle
+    try:
+        await page.wait_for_load_state("networkidle", timeout=_AJAX_WAIT)
+    except PWTimeout:
+        pass
 
 
 async def _llenar_cedula(page: Page, cedula: str) -> None:
-    """Llena el campo de documento con la cédula."""
+    """
+    Llena el input de número de documento con la cédula.
+    ID descubierto: contiene 'txtParametroCapDoc'.
+    """
     selectores = [
+        "input[id*='txtParametroCapDoc']",   # ID exacto confirmado
+        "input[id*='txtParametro']",
+        "input[id*='numDoc']",
+        "input[id*='NumDoc']",
         "input[id*='documento']",
         "input[id*='Documento']",
         "input[id*='cedula']",
-        "input[id*='numDoc']",
-        "input[placeholder*='ocumento']",   # "Documento" o "documento"
-        "input[placeholder*='édula']",       # "Cédula" o "cédula"
+        "input[id*='Cedula']",
     ]
-    for sel in selectores:
-        loc = page.locator(sel).first
+    for sel_css in selectores:
+        loc = page.locator(sel_css).first
         if await loc.count() > 0:
-            await loc.clear()
-            await loc.fill(cedula)
-            return
-    # Fallback: segundo input de texto (el primero suele ser el del dropdown)
-    fallback = page.locator("input[type='text']").nth(1)
-    if await fallback.count() > 0:
-        await fallback.clear()
-        await fallback.fill(cedula)
-        return
+            try:
+                if await loc.is_visible():
+                    await loc.clear()
+                    await loc.fill(cedula)
+                    logger.debug(f"[SETEC] _llenar_cedula OK via {sel_css}")
+                    return
+            except Exception:
+                continue
+
+    # Fallback: primer input de texto visible que no sea el focus del combobox
+    all_inputs = page.locator("input[type='text']")
+    count = await all_inputs.count()
+    for i in range(count):
+        inp = all_inputs.nth(i)
+        inp_id = await inp.get_attribute("id") or ""
+        if "focus" in inp_id or "filter" in inp_id:
+            continue
+        try:
+            if await inp.is_visible():
+                await inp.clear()
+                await inp.fill(cedula)
+                logger.debug(f"[SETEC] _llenar_cedula OK fallback input #{i}")
+                return
+        except Exception:
+            continue
+
     raise RuntimeError("No se encontró el campo de cédula en el portal SETEC")
 
 
 async def _clic_buscar(page: Page) -> None:
-    """Hace clic en el botón Buscar."""
+    """
+    Hace clic en el botón Buscar.
+    Confirmado como <button> con texto 'Buscar'.
+    """
     selectores = [
         "button:has-text('Buscar')",
         "input[value='Buscar']",
         "a:has-text('Buscar')",
-        "span:has-text('Buscar')",
-        "[id*='buscar']",
-        "[id*='Buscar']",
+        "[id*='btnBuscar']",
+        "[id*='buscar']:not([id*='cancel']):not([id*='limpiar'])",
     ]
-    for sel in selectores:
-        loc = page.locator(sel).first
+    for sel_css in selectores:
+        loc = page.locator(sel_css).first
         if await loc.count() > 0:
-            await loc.click()
-            return
+            try:
+                if await loc.is_visible():
+                    await loc.click()
+                    logger.debug(f"[SETEC] _clic_buscar OK via {sel_css}")
+                    return
+            except Exception:
+                continue
+
     raise RuntimeError("No se encontró el botón Buscar en el portal SETEC")
 
 
 async def _esperar_ajax(page: Page) -> None:
-    """Espera que el AJAX de JSF termine de actualizar la tabla."""
-    # Estrategia 1: networkidle (más confiable en JSF)
+    """Espera que el AJAX de búsqueda actualice la tabla de resultados."""
     try:
         await page.wait_for_load_state("networkidle", timeout=_AJAX_WAIT)
         return
     except PWTimeout:
         pass
-    # Estrategia 2: esperar que aparezca la tabla o un mensaje de vacío
     try:
         await page.wait_for_selector(
             "table tbody tr, [id*='noData'], [class*='ui-datatable-empty']",
             timeout=_AJAX_WAIT,
         )
     except PWTimeout:
-        pass  # Si sigue sin tabla, lo detectamos en _extraer_cursos
+        pass
 
 
 async def _extraer_cursos(page: Page) -> list[str]:
     """
     Extrae los cursos de la tabla de resultados.
-    Columnas esperadas: Nombre Curso / Perfil | ... | Número Horas | ...
+    Columnas: Nombre Curso / Perfil | ... | Número Horas | ...
     """
-    # Buscar la tabla que contenga datos de cursos
     tabla = page.locator("table").filter(has_text="Nombre Curso")
     if await tabla.count() == 0:
-        # Fallback: primera tabla con tbody y filas
         tabla = page.locator("table:has(tbody tr)").first
 
     if await tabla.count() == 0:
         return []
 
-    # Detectar índices de columnas desde el encabezado
     idx_nombre = 0
     idx_horas  = None
     encabezados_raw = await tabla.locator("thead th, thead td").all_inner_texts()
@@ -246,7 +315,6 @@ async def _extraer_cursos(page: Page) -> list[str]:
         if "hora" in h:
             idx_horas = i
 
-    # Extraer filas del tbody
     filas = tabla.locator("tbody tr")
     n = await filas.count()
     cursos: list[str] = []
@@ -268,7 +336,6 @@ async def _extraer_cursos(page: Page) -> list[str]:
             if h.isdigit():
                 horas = h
         else:
-            # Buscar horas heurísticamente: número razonable (1-999)
             for c in celdas[1:]:
                 limpio = c.strip()
                 if limpio.isdigit() and 1 <= int(limpio) <= 999:
