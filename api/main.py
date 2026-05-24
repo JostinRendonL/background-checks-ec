@@ -37,6 +37,7 @@ load_dotenv(ROOT / ".env")
 
 from src.verificador_bachiller import consultar_cedula as verificar_bachiller
 from src.verificador_satje import consultar_satje
+from src.verificador_setec import consultar_setec
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -97,10 +98,11 @@ async def health():
     """Healthcheck — confirma que el servidor está operativo."""
     return {
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "modulos": {
             "bachiller": "activo",
             "satje":     "activo",
+            "setec":     "activo",
         }
     }
 
@@ -137,10 +139,26 @@ async def consultar_satje_ep(req: ConsultaRequest):
     return resultado
 
 
+@app.post("/consultar/setec", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
+async def consultar_setec_ep(req: ConsultaRequest):
+    """
+    Verifica certificaciones de capacitación registradas en el SETEC
+    (Ministerio de Trabajo).
+    """
+    cedula = req.cedula.strip()
+    _validar_cedula(cedula)
+    logger.info(f"[API] /setec → {cedula}")
+    t0 = time.time()
+    async with _semaphore:
+        resultado = await consultar_setec(cedula)
+    resultado["tiempo_seg"] = round(time.time() - t0, 2)
+    return resultado
+
+
 @app.post("/consultar/completo", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
 async def consultar_completo_ep(req: ConsultaRequest):
     """
-    Ejecuta todos los módulos disponibles en paralelo para una cédula.
+    Ejecuta todos los módulos en paralelo: bachiller, SATJE y SETEC.
     Devuelve un reporte consolidado con semáforo de riesgo.
     """
     cedula = req.cedula.strip()
@@ -149,17 +167,16 @@ async def consultar_completo_ep(req: ConsultaRequest):
     t0 = time.time()
 
     async with _semaphore:
-        bachiller_task = asyncio.to_thread(verificar_bachiller, cedula)
-        satje_task     = consultar_satje(cedula)
-
         resultados = await asyncio.gather(
-            bachiller_task,
-            satje_task,
-            return_exceptions=True
+            asyncio.to_thread(verificar_bachiller, cedula),
+            consultar_satje(cedula),
+            consultar_setec(cedula),
+            return_exceptions=True,
         )
 
     bachiller_res = resultados[0] if not isinstance(resultados[0], Exception) else {"estado": "ERROR", "detalle": str(resultados[0])}
     satje_res     = resultados[1] if not isinstance(resultados[1], Exception) else {"status": "ERROR", "detalle": str(resultados[1])}
+    setec_res     = resultados[2] if not isinstance(resultados[2], Exception) else {"error": str(resultados[2]), "tiene_certificados": False, "detalle_cursos": "N/A", "total_cursos": 0}
 
     semaforo = _calcular_semaforo(bachiller_res, satje_res)
 
@@ -168,6 +185,7 @@ async def consultar_completo_ep(req: ConsultaRequest):
         "semaforo":   semaforo,
         "bachiller":  bachiller_res,
         "satje":      satje_res,
+        "setec":      setec_res,
         "tiempo_seg": round(time.time() - t0, 2),
     }
 
