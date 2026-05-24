@@ -210,6 +210,9 @@ def _normalizar_causa(raw: dict, rol: str) -> dict:
         "judicatura":       raw.get("nombreJudicatura") or "",
         "provincia":        raw.get("nombreProvincia") or "",
         "tipoAccion":       raw.get("nombreTipoAccion") or "",
+        # Nombres (útiles como fallback si Bachiller no encuentra)
+        "nombreActor":      raw.get("nombreActor") or "",
+        "nombreDemandado":  raw.get("nombreDemandado") or "",
     }
 
 
