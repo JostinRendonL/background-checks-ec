@@ -123,7 +123,7 @@ async def _consultar_en_page(cedula: str, page: Page) -> dict[str, Any]:
                 pass
 
         # 8. Extraer tabla
-        cursos = await _extraer_cursos(page)
+        cursos, nombre_detectado = await _extraer_cursos_y_nombre(page)
 
         if cursos:
             detalle = " | ".join(cursos)
@@ -133,6 +133,7 @@ async def _consultar_en_page(cedula: str, page: Page) -> dict[str, Any]:
                 "tiene_certificados": True,
                 "detalle_cursos":     detalle,
                 "total_cursos":       len(cursos),
+                "nombre":             nombre_detectado or "",
             }
         else:
             logger.info(f"[SETEC] {cedula} → tabla vacía")
@@ -303,6 +304,42 @@ async def _esperar_ajax(page: Page) -> None:
         pass
 
 
+async def _extraer_cursos_y_nombre(page: Page) -> tuple[list[str], str | None]:
+    """
+    Wrapper que devuelve también el nombre de la persona (col 1: "Apellidos / Nombres").
+    """
+    cursos = await _extraer_cursos(page)
+    nombre = await _extraer_nombre_setec(page)
+    return cursos, nombre
+
+
+async def _extraer_nombre_setec(page: Page) -> str | None:
+    """
+    Extrae el nombre de la persona de la columna "Apellidos / Nombres"
+    (índice fijo 1 en la tabla de resultados SETEC).
+    """
+    try:
+        tabla = page.locator("div.ui-datatable-tablewrapper table[role='grid']").first
+        if await tabla.count() == 0:
+            tabla = page.locator("table[role='grid']").first
+        if await tabla.count() == 0:
+            return None
+        primera = tabla.locator("tbody tr").first
+        if await primera.count() == 0:
+            return None
+        cls = await primera.get_attribute("class") or ""
+        if "ui-datatable-empty-message" in cls:
+            return None
+        celdas = await primera.locator("td").all_inner_texts()
+        if len(celdas) > 1:
+            nombre = " ".join(celdas[1].split()).strip()
+            if nombre and len(nombre) > 3:
+                return nombre.upper()
+    except Exception as exc:
+        logger.debug(f"[SETEC] _extraer_nombre_setec: {exc}")
+    return None
+
+
 async def _extraer_cursos(page: Page) -> list[str]:
     """
     Extrae los cursos de la tabla de resultados.
@@ -399,6 +436,7 @@ def _sin_registros() -> dict[str, Any]:
         "tiene_certificados": False,
         "detalle_cursos":     "Sin registros",
         "total_cursos":       0,
+        "nombre":             "",
     }
 
 
@@ -408,4 +446,5 @@ def _error(msg: str) -> dict[str, Any]:
         "tiene_certificados": False,
         "detalle_cursos":     "N/A",
         "total_cursos":       0,
+        "nombre":             "",
     }
