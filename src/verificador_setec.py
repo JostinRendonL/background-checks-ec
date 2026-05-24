@@ -103,14 +103,24 @@ async def _consultar_en_page(cedula: str, page: Page) -> dict[str, Any]:
         # 5. Clic en Buscar
         await _clic_buscar(page)
 
-        # 6. Esperar respuesta AJAX de la tabla
+        # 6. Esperar respuesta AJAX de la tabla (o del mensaje vacío)
         await _esperar_ajax(page)
 
-        # 7. Comprobar mensaje de sin resultados
-        body = (await page.locator("body").inner_text()).lower()
-        if any(f in body for f in _FRASES_VACIO):
-            logger.info(f"[SETEC] {cedula} → sin registros")
-            return _sin_registros()
+        # 7. Comprobar mensaje de "sin resultados" usando elemento específico
+        #    de PrimeFaces (tr.ui-datatable-empty-message) — NO el body completo,
+        #    porque "sin registros" puede aparecer en tooltips o templates ocultos.
+        empty_msg = page.locator(
+            "tr.ui-datatable-empty-message, "
+            "div.ui-datatable-empty-message, "
+            "[class*='datatable-empty']"
+        )
+        if await empty_msg.count() > 0:
+            try:
+                if await empty_msg.first.is_visible():
+                    logger.info(f"[SETEC] {cedula} → sin registros (empty-message visible)")
+                    return _sin_registros()
+            except Exception:
+                pass
 
         # 8. Extraer tabla
         cursos = await _extraer_cursos(page)
@@ -296,37 +306,76 @@ async def _esperar_ajax(page: Page) -> None:
 async def _extraer_cursos(page: Page) -> list[str]:
     """
     Extrae los cursos de la tabla de resultados.
-    Columnas: Nombre Curso / Perfil | ... | Número Horas | ...
+
+    Estructura confirmada del DOM (PrimeFaces <p:dataTable> 2026-05-24):
+      <div class="ui-datatable-tablewrapper">
+        <table role="grid">
+          <thead>
+            <tr>
+              <th>Número Documento</th>        # 0
+              <th>Apellidos / Nombres</th>     # 1
+              <th>Tipo Capacitación</th>       # 2
+              <th>Nombre Curso / Perfil</th>   # 3  ← curso
+              <th>Número Horas</th>            # 4  ← horas
+              <th>Razón Social OC</th>         # 5
+              <th>Nombre Comercial OC</th>     # 6  (puede estar vacía)
+              <th>Número Certificado</th>      # 7
+            </tr>
+          </thead>
+          <tbody><tr>...</tr></tbody>
+        </table>
+      </div>
+
+    BUG HISTÓRICO: el match anterior usaba `if "nombre" in h` y por eso elegía
+    la columna 6 ("Nombre Comercial OC") como idx_nombre — esa columna está
+    vacía para muchas personas → la fila se descartaba → falso negativo.
+    Fix: matchear sólo por "curso" o "perfil" (específicos y unívocos).
     """
-    tabla = page.locator("table").filter(has_text="Nombre Curso")
+    # 1. Elegir la tabla correcta — preferimos role=grid dentro del wrapper.
+    tabla = page.locator("div.ui-datatable-tablewrapper table[role='grid']").first
+    if await tabla.count() == 0:
+        tabla = page.locator("table[role='grid']").first
     if await tabla.count() == 0:
         tabla = page.locator("table:has(tbody tr)").first
-
     if await tabla.count() == 0:
         return []
 
-    idx_nombre = 0
-    idx_horas  = None
+    # 2. Detectar columnas — "curso"/"perfil" es específico; "nombre" no lo es
+    #    (matchea "Apellidos / Nombres" y "Nombre Comercial OC").
+    idx_nombre: int | None = None
+    idx_horas:  int | None = None
     encabezados_raw = await tabla.locator("thead th, thead td").all_inner_texts()
     encabezados = [h.strip().lower() for h in encabezados_raw]
     for i, h in enumerate(encabezados):
-        if "nombre" in h or "curso" in h or "perfil" in h:
+        if "curso" in h or "perfil" in h:
             idx_nombre = i
         if "hora" in h:
             idx_horas = i
 
+    # Fallback si no se detectó por header: usar posición fija conocida
+    if idx_nombre is None:
+        idx_nombre = 3   # Nombre Curso / Perfil
+    if idx_horas is None:
+        idx_horas = 4    # Número Horas
+
+    # 3. Iterar filas tbody y armar la lista
     filas = tabla.locator("tbody tr")
     n = await filas.count()
     cursos: list[str] = []
 
     for i in range(n):
+        # Saltar fila de "empty message" de PrimeFaces
+        fila_class = await filas.nth(i).get_attribute("class") or ""
+        if "ui-datatable-empty-message" in fila_class:
+            continue
+
         celdas_raw = await filas.nth(i).locator("td").all_inner_texts()
         celdas = [c.strip() for c in celdas_raw]
-
         if not celdas:
             continue
 
         nombre = celdas[idx_nombre] if idx_nombre < len(celdas) else ""
+        nombre = " ".join(nombre.split())  # colapsar whitespace interno
         if not nombre or nombre.lower() in _HEADERS_IGNORAR:
             continue
 
@@ -335,12 +384,6 @@ async def _extraer_cursos(page: Page) -> list[str]:
             h = celdas[idx_horas].strip()
             if h.isdigit():
                 horas = h
-        else:
-            for c in celdas[1:]:
-                limpio = c.strip()
-                if limpio.isdigit() and 1 <= int(limpio) <= 999:
-                    horas = limpio
-                    break
 
         entrada = f"{nombre.upper()} ({horas}h)" if horas else nombre.upper()
         cursos.append(entrada)
