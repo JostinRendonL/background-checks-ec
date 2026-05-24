@@ -158,8 +158,8 @@ async def consultar_setec_ep(req: ConsultaRequest):
 @app.post("/consultar/completo", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
 async def consultar_completo_ep(req: ConsultaRequest):
     """
-    Ejecuta todos los módulos en paralelo: bachiller, SATJE y SETEC.
-    Devuelve un reporte consolidado con semáforo de riesgo.
+    Ejecuta bachiller + SATJE en paralelo. SETEC se consulta por separado
+    via /consultar/setec para no bloquear el resultado principal.
     """
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
@@ -170,13 +170,11 @@ async def consultar_completo_ep(req: ConsultaRequest):
         resultados = await asyncio.gather(
             asyncio.to_thread(verificar_bachiller, cedula),
             consultar_satje(cedula),
-            consultar_setec(cedula),
             return_exceptions=True,
         )
 
     bachiller_res = resultados[0] if not isinstance(resultados[0], Exception) else {"estado": "ERROR", "detalle": str(resultados[0])}
     satje_res     = resultados[1] if not isinstance(resultados[1], Exception) else {"status": "ERROR", "detalle": str(resultados[1])}
-    setec_res     = resultados[2] if not isinstance(resultados[2], Exception) else {"error": str(resultados[2]), "tiene_certificados": False, "detalle_cursos": "N/A", "total_cursos": 0}
 
     semaforo = _calcular_semaforo(bachiller_res, satje_res)
 
@@ -185,7 +183,6 @@ async def consultar_completo_ep(req: ConsultaRequest):
         "semaforo":   semaforo,
         "bachiller":  bachiller_res,
         "satje":      satje_res,
-        "setec":      setec_res,
         "tiempo_seg": round(time.time() - t0, 2),
     }
 
