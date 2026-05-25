@@ -39,6 +39,7 @@ from src.verificador_bachiller import consultar_cedula as verificar_bachiller
 from src.verificador_satje import consultar_satje
 from src.verificador_setec import consultar_setec
 from src.obs import init_sentry, capture_exception
+from src.metrics import setup_metrics
 
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="bg-api")
@@ -76,6 +77,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Métricas Prometheus opt-in (si METRICS_ENABLED=1)
+setup_metrics(app)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
