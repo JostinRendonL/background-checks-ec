@@ -98,17 +98,59 @@ _semaphore = asyncio.Semaphore(SEMAPHORE_CONCURRENCIA)
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["Sistema"])
-async def health():
-    """Healthcheck — confirma que el servidor está operativo."""
-    return {
-        "status": "ok",
-        "version": "1.1.0",
+async def health(deep: bool = False):
+    """
+    Healthcheck.
+      /health         — liveness rápido (Docker HEALTHCHECK)
+      /health?deep=1  — valida que Playwright pueda lanzar Chromium + SATJE responde
+    """
+    base = {
+        "status":  "ok",
+        "version": "1.2.0",
+        "sentry":  "enabled" if os.getenv("SENTRY_DSN") else "disabled",
         "modulos": {
             "bachiller": "activo",
             "satje":     "activo",
             "setec":     "activo",
-        }
+        },
+        "concurrencia": SEMAPHORE_CONCURRENCIA,
     }
+    if not deep:
+        return base
+
+    deps = {}
+
+    # 1) Playwright — chromium puede arrancar?
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            await browser.close()
+        deps["playwright"] = {"status": "ok"}
+    except Exception as e:
+        deps["playwright"] = {"status": "down", "error": str(e)[:120]}
+
+    # 2) SATJE upstream — responde el portal?
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=5.0, verify=False) as client:
+            r = await client.get("https://procesosjudiciales.funcionjudicial.gob.ec/")
+            deps["satje_upstream"] = {
+                "status":    "ok" if r.status_code < 500 else "degraded",
+                "http_code": r.status_code,
+            }
+    except Exception as e:
+        deps["satje_upstream"] = {"status": "down", "error": str(e)[:120]}
+
+    overall = "ok"
+    for v in deps.values():
+        if v.get("status") == "down":
+            overall = "down"
+            break
+        if v.get("status") == "degraded" and overall == "ok":
+            overall = "degraded"
+
+    return {**base, "status": overall, "deps": deps}
 
 
 @app.post("/consultar/bachiller", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
