@@ -38,6 +38,10 @@ load_dotenv(ROOT / ".env")
 from src.verificador_bachiller import consultar_cedula as verificar_bachiller
 from src.verificador_satje import consultar_satje
 from src.verificador_setec import consultar_setec
+from src.obs import init_sentry, capture_exception
+
+# Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
+init_sentry(servicio="bg-api")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -218,6 +222,7 @@ async def consultar_batch_ep(req: BatchRequest):
                     "satje":     satje_res,
                 }
             except Exception as e:
+                capture_exception("batch.procesar_una", e, extra={"cedula": cedula})
                 return {"cedula": cedula, "semaforo": "ERROR", "error": str(e)}
 
     resultados = await asyncio.gather(*[procesar_una(c) for c in cedulas])
