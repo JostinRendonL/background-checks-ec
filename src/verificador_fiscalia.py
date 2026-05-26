@@ -30,6 +30,41 @@ try:
 except ImportError:
     _HAS_STEALTH_LIB = False
 
+# Pool de browsers (singleton, inicializado lazy desde get_fiscalia_pool)
+from src.browser_pool import BrowserPool
+
+_fiscalia_pool: BrowserPool | None = None
+
+
+def get_fiscalia_pool() -> BrowserPool:
+    """
+    Devuelve el pool singleton de browsers para Fiscalía.
+    Lazy init: la primera llamada construye el pool con la config del proxy
+    actual. start() se llama en api/main.py startup_event.
+    """
+    global _fiscalia_pool
+    if _fiscalia_pool is None:
+        proxy_cfg = _build_proxy_cfg()
+        size = int(os.getenv("FISCALIA_POOL_SIZE", "3"))
+        launch_kwargs = {
+            "headless": True,
+            "proxy":    proxy_cfg,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--lang=es-EC",
+            ],
+        }
+        _fiscalia_pool = BrowserPool(
+            size=size,
+            launch_kwargs=launch_kwargs,
+            max_uses_per_browser=25,   # rota IP de Decodo cada 25 usos
+            name="fiscalia",
+        )
+    return _fiscalia_pool
+
 logger = logging.getLogger(__name__)
 
 _URL         = "https://www.gestiondefiscalias.gob.ec/siaf/informacion/web/noticiasdelito/index.php"
@@ -179,19 +214,15 @@ async def _intentar_browser_api(cedula: str) -> dict:
 
 
 async def _intentar_proxy(cedula: str, proxy_cfg: dict | None) -> dict:
-    """Fallback: Playwright local + proxy residencial + stealth manual."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            proxy=proxy_cfg,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-                "--lang=es-EC",
-            ],
-        )
+    """
+    Toma un browser del pool tibio (ahorra 5-10s de launch), crea un
+    BrowserContext aislado y ejecuta la consulta. Devuelve el browser
+    al pool al final (el pool rota IPs automáticamente cada N usos).
+    """
+    pool = get_fiscalia_pool()
+    browser = await pool.acquire(timeout=60.0)
+    ctx = None
+    try:
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -215,10 +246,14 @@ async def _intentar_proxy(cedula: str, proxy_cfg: dict | None) -> dict:
             except Exception as e:
                 logger.warning(f"[FISCALIA] stealth_async fallo (no critico): {e}")
 
-        try:
-            return await _consultar_en_page(cedula, page)
-        finally:
-            await browser.close()
+        return await _consultar_en_page(cedula, page)
+    finally:
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        await pool.release(browser)
 
 
 async def _consultar_en_page_browser_api(cedula: str, page) -> dict:

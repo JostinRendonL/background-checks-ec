@@ -582,10 +582,37 @@ async def cache_stats_ep():
     return await redis_cache_stats()
 
 
+# ── Browser pool management ──────────────────────────────────────────────────
+
+@app.get("/pool/stats", tags=["Sistema"], dependencies=[Depends(verificar_api_key)])
+async def pool_stats_ep():
+    """Estado del pool de browsers Chromium pre-calentados."""
+    from src.verificador_fiscalia import get_fiscalia_pool
+    return {"fiscalia": get_fiscalia_pool().stats()}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-calentar el pool de browsers para Fiscalía al arrancar."""
+    if os.getenv("BROWSER_POOL_EAGER_START", "1") == "1":
+        try:
+            from src.verificador_fiscalia import get_fiscalia_pool
+            logger.info("[STARTUP] Pre-calentando pool de browsers Fiscalia...")
+            await get_fiscalia_pool().start()
+            logger.info("[STARTUP] Pool Fiscalia listo")
+        except Exception as e:
+            logger.error(f"[STARTUP] Error inicializando pool: {e}")
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cerrar conexiones limpias al apagar el servicio."""
     try:
         await close_cache()
+    except Exception:
+        pass
+    try:
+        from src.verificador_fiscalia import get_fiscalia_pool
+        await get_fiscalia_pool().shutdown()
     except Exception:
         pass
