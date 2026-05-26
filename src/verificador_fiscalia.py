@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from typing import Any
 
@@ -26,10 +27,28 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 logger = logging.getLogger(__name__)
 
 _URL         = "https://www.gestiondefiscalias.gob.ec/siaf/informacion/web/noticiasdelito/index.php"
-_TIMEOUT_NAV = 35_000
+_TIMEOUT_NAV = 45_000
 _TIMEOUT_RES = 18_000
 _SLEEP_INIT  = 3.5
 _SLEEP_CLICK = 4.0
+
+# Proxy residencial (recomendado: Ecuador / LATAM) — opcional
+# Formato URL: http://user:pass@host:port  o  socks5://user:pass@host:port
+_PROXY_URL  = os.getenv("FISCALIA_PROXY_URL", "").strip()
+_PROXY_USER = os.getenv("FISCALIA_PROXY_USER", "").strip()
+_PROXY_PASS = os.getenv("FISCALIA_PROXY_PASS", "").strip()
+
+
+def _build_proxy_cfg() -> dict | None:
+    """Construye el dict de proxy para Playwright si las env vars estan seteadas."""
+    if not _PROXY_URL:
+        return None
+    cfg: dict[str, str] = {"server": _PROXY_URL}
+    if _PROXY_USER:
+        cfg["username"] = _PROXY_USER
+    if _PROXY_PASS:
+        cfg["password"] = _PROXY_PASS
+    return cfg
 
 _STEALTH_JS = """
     Object.defineProperty(navigator, 'webdriver',          {get: () => undefined});
@@ -62,9 +81,14 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
     cedula = (cedula or "").strip()
     logger.info(f"[FISCALIA] Consultando cedula: {cedula}")
 
+    proxy_cfg = _build_proxy_cfg()
+    if proxy_cfg:
+        logger.info(f"[FISCALIA] Usando proxy residencial: {proxy_cfg['server']}")
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
+            proxy=proxy_cfg,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -100,6 +124,17 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
 
 
 async def _consultar_en_page(cedula: str, page) -> dict:
+    # Warming: visitar primero la home del dominio para asentar cookies de Incapsula
+    try:
+        await page.goto(
+            "https://www.gestiondefiscalias.gob.ec/",
+            wait_until="domcontentloaded",
+            timeout=_TIMEOUT_NAV,
+        )
+        await asyncio.sleep(2.0)
+    except Exception as e:
+        logger.warning(f"[FISCALIA] warming fallo (no critico): {e}")
+
     await page.goto(_URL, wait_until="domcontentloaded", timeout=_TIMEOUT_NAV)
     await asyncio.sleep(_SLEEP_INIT)
 
