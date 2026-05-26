@@ -27,10 +27,11 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 logger = logging.getLogger(__name__)
 
 _URL         = "https://www.gestiondefiscalias.gob.ec/siaf/informacion/web/noticiasdelito/index.php"
-_TIMEOUT_NAV = 45_000
-_TIMEOUT_RES = 18_000
-_SLEEP_INIT  = 3.5
-_SLEEP_CLICK = 4.0
+_TIMEOUT_NAV    = 75_000   # navegacion principal (proxy residencial es lento)
+_TIMEOUT_WARM   = 12_000   # warming homepage (no critico, falla silencioso)
+_TIMEOUT_RES    = 18_000
+_SLEEP_INIT     = 3.0
+_SLEEP_CLICK    = 4.0
 
 # Proxy residencial (recomendado: Ecuador / LATAM) — opcional
 # Formato URL: http://user:pass@host:port  o  socks5://user:pass@host:port
@@ -125,14 +126,15 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
 
 
 async def _consultar_en_page(cedula: str, page) -> dict:
-    # Warming: visitar primero la home del dominio para asentar cookies de Incapsula
+    # Warming: visitar primero la home para asentar cookies de Incapsula
+    # Timeout corto — si falla no importa, seguimos igual
     try:
         await page.goto(
             "https://www.gestiondefiscalias.gob.ec/",
-            wait_until="domcontentloaded",
-            timeout=_TIMEOUT_NAV,
+            wait_until="commit",      # solo espera headers, no DOM completo
+            timeout=_TIMEOUT_WARM,
         )
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.5)
     except Exception as e:
         logger.warning(f"[FISCALIA] warming fallo (no critico): {e}")
 
