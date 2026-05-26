@@ -109,6 +109,17 @@ async def health(deep: bool = False):
       /health         — liveness rápido (Docker HEALTHCHECK)
       /health?deep=1  — valida que Playwright pueda lanzar Chromium + SATJE responde
     """
+    # Debug: ver qué env vars está leyendo el codigo de Fiscalia AHORA
+    fisc_browser_api = os.getenv("FISCALIA_BROWSER_API_URL", "").strip()
+    fisc_proxy_url   = os.getenv("FISCALIA_PROXY_URL", "").strip()
+    fisc_proxy_user  = os.getenv("FISCALIA_PROXY_USER", "").strip()
+    if fisc_browser_api:
+        modo_fiscalia = f"Browser API ACTIVO -> {fisc_browser_api[:60]}..."
+    elif fisc_proxy_url:
+        modo_fiscalia = f"Proxy: {fisc_proxy_url} (user: {fisc_proxy_user[:25]}...)"
+    else:
+        modo_fiscalia = "Sin proxy ni browser API"
+
     base = {
         "status":  "ok",
         "version": "1.2.0",
@@ -119,7 +130,8 @@ async def health(deep: bool = False):
             "setec":     "activo",
             "fiscalia":  "activo",
         },
-        "concurrencia": SEMAPHORE_CONCURRENCIA,
+        "concurrencia":   SEMAPHORE_CONCURRENCIA,
+        "fiscalia_modo":  modo_fiscalia,
     }
     if not deep:
         return base
