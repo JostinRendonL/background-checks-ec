@@ -24,6 +24,12 @@ from typing import Any
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+try:
+    from playwright_stealth import stealth_async
+    _HAS_STEALTH_LIB = True
+except ImportError:
+    _HAS_STEALTH_LIB = False
+
 logger = logging.getLogger(__name__)
 
 _URL         = "https://www.gestiondefiscalias.gob.ec/siaf/informacion/web/noticiasdelito/index.php"
@@ -139,6 +145,16 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
         )
         await ctx.add_init_script(_STEALTH_JS)
         page = await ctx.new_page()
+
+        # Aplicar playwright-stealth (cubre TLS, audio, canvas, fonts, etc)
+        # Mucho mas completo que nuestro _STEALTH_JS manual
+        if _HAS_STEALTH_LIB:
+            try:
+                await stealth_async(page)
+                logger.info("[FISCALIA] playwright-stealth aplicado")
+            except Exception as e:
+                logger.warning(f"[FISCALIA] stealth_async fallo (no critico): {e}")
+
         try:
             result = await _consultar_en_page(cedula, page)
         except Exception as exc:
