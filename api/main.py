@@ -256,6 +256,216 @@ async def consultar_fiscalia_ep(req: ConsultaRequest):
     return resultado
 
 
+@app.get("/diagnostico/fiscalia", tags=["Diagnostico"], dependencies=[Depends(verificar_api_key)])
+async def diagnostico_fiscalia_ep():
+    """
+    Diagnostico de 4 niveles del proxy + scraper Fiscalia.
+    Devuelve qué pasa en cada nivel para identificar exactamente dónde falla.
+
+    Test 1: httpx via proxy -> ipinfo.io (proxy basico OK?)
+    Test 2: httpx via proxy -> SIAF homepage (sitio responde sin browser?)
+    Test 3: Playwright via proxy -> ipinfo.io (Playwright + proxy OK?)
+    Test 4: Playwright via proxy -> SIAF index.php, paso a paso (donde se cuelga?)
+    """
+    import httpx as _httpx
+    from playwright.async_api import async_playwright as _pw
+
+    proxy_url  = os.getenv("FISCALIA_PROXY_URL", "").strip()
+    proxy_user = os.getenv("FISCALIA_PROXY_USER", "").strip()
+    proxy_pass = os.getenv("FISCALIA_PROXY_PASS", "").strip()
+
+    if not proxy_url:
+        return {"error": "FISCALIA_PROXY_URL no configurado en env"}
+
+    # Construir URL httpx con auth inline
+    if proxy_user and proxy_pass:
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy_url)
+        proxy_for_httpx = f"{parsed.scheme}://{proxy_user}:{proxy_pass}@{parsed.hostname}:{parsed.port}"
+    else:
+        proxy_for_httpx = proxy_url
+
+    proxy_for_playwright = {"server": proxy_url}
+    if proxy_user:
+        proxy_for_playwright["username"] = proxy_user
+    if proxy_pass:
+        proxy_for_playwright["password"] = proxy_pass
+
+    results: dict[str, dict] = {
+        "proxy_configurado": {
+            "server": proxy_url,
+            "user":   proxy_user[:20] + "..." if len(proxy_user) > 20 else proxy_user,
+            "tiene_pass": bool(proxy_pass),
+        },
+    }
+
+    # ── Test 1: httpx via proxy a ipinfo.io ────────────────────────────────
+    t0 = time.time()
+    try:
+        async with _httpx.AsyncClient(
+            proxy=proxy_for_httpx,
+            verify=False,
+            timeout=20.0,
+            follow_redirects=True,
+        ) as client:
+            r = await client.get("https://ipinfo.io/json")
+            data = r.json()
+        results["test_1_httpx_ipinfo"] = {
+            "status":     "ok",
+            "http_code":  r.status_code,
+            "ip":         data.get("ip"),
+            "country":    data.get("country"),
+            "region":     data.get("region"),
+            "org":        data.get("org"),
+            "tiempo_seg": round(time.time() - t0, 2),
+        }
+    except Exception as e:
+        results["test_1_httpx_ipinfo"] = {
+            "status":     "fail",
+            "error":      f"{type(e).__name__}: {str(e)[:200]}",
+            "tiempo_seg": round(time.time() - t0, 2),
+        }
+
+    # ── Test 2: httpx via proxy a SIAF homepage ────────────────────────────
+    t0 = time.time()
+    try:
+        async with _httpx.AsyncClient(
+            proxy=proxy_for_httpx,
+            verify=False,
+            timeout=30.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "es-EC,es;q=0.9",
+            },
+        ) as client:
+            r = await client.get("https://www.gestiondefiscalias.gob.ec/siaf/informacion/web/noticiasdelito/index.php")
+            body = r.text[:500]
+        results["test_2_httpx_siaf"] = {
+            "status":     "ok",
+            "http_code":  r.status_code,
+            "body_len":   len(r.text),
+            "has_pwd":    "id=\"pwd\"" in r.text or "id='pwd'" in r.text,
+            "incapsula":  "incapsula" in r.text.lower() or "_incap_" in r.text.lower(),
+            "body_head":  body,
+            "tiempo_seg": round(time.time() - t0, 2),
+        }
+    except Exception as e:
+        results["test_2_httpx_siaf"] = {
+            "status":     "fail",
+            "error":      f"{type(e).__name__}: {str(e)[:200]}",
+            "tiempo_seg": round(time.time() - t0, 2),
+        }
+
+    # ── Test 3: Playwright via proxy a ipinfo.io ───────────────────────────
+    t0 = time.time()
+    try:
+        async with _pw() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_for_playwright,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = await browser.new_context(ignore_https_errors=True)
+            page = await ctx.new_page()
+            await page.goto("https://ipinfo.io/json", wait_until="domcontentloaded", timeout=30_000)
+            content = await page.content()
+            await browser.close()
+        results["test_3_playwright_ipinfo"] = {
+            "status":     "ok",
+            "body_len":   len(content),
+            "body_head":  content[:300],
+            "tiempo_seg": round(time.time() - t0, 2),
+        }
+    except Exception as e:
+        results["test_3_playwright_ipinfo"] = {
+            "status":     "fail",
+            "error":      f"{type(e).__name__}: {str(e)[:300]}",
+            "tiempo_seg": round(time.time() - t0, 2),
+        }
+
+    # ── Test 4: Playwright via proxy a SIAF, paso a paso ───────────────────
+    pasos = {}
+    t0_total = time.time()
+    try:
+        async with _pw() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_for_playwright,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 768},
+                locale="es-EC",
+                ignore_https_errors=True,
+            )
+            page = await ctx.new_page()
+
+            # Paso 4a: goto con wait_until="commit" (solo headers)
+            t = time.time()
+            try:
+                resp = await page.goto(
+                    "https://www.gestiondefiscalias.gob.ec/siaf/informacion/web/noticiasdelito/index.php",
+                    wait_until="commit",
+                    timeout=30_000,
+                )
+                pasos["4a_goto_commit"] = {
+                    "status":     "ok",
+                    "http_code":  resp.status if resp else None,
+                    "tiempo_seg": round(time.time() - t, 2),
+                }
+            except Exception as e:
+                pasos["4a_goto_commit"] = {
+                    "status":     "fail",
+                    "error":      f"{type(e).__name__}: {str(e)[:200]}",
+                    "tiempo_seg": round(time.time() - t, 2),
+                }
+                raise
+
+            # Paso 4b: esperar #pwd hasta 45s
+            t = time.time()
+            try:
+                await page.wait_for_selector("#pwd", state="visible", timeout=45_000)
+                pasos["4b_wait_pwd"] = {
+                    "status":     "ok",
+                    "tiempo_seg": round(time.time() - t, 2),
+                }
+            except Exception as e:
+                # Capturar HTML actual para entender qué llegó
+                try:
+                    body = await page.content()
+                except Exception:
+                    body = ""
+                pasos["4b_wait_pwd"] = {
+                    "status":     "fail",
+                    "error":      f"{type(e).__name__}: {str(e)[:150]}",
+                    "tiempo_seg": round(time.time() - t, 2),
+                    "body_len":   len(body),
+                    "incapsula":  "incapsula" in body.lower() or "_incap_" in body.lower(),
+                    "body_head":  body[:500],
+                }
+
+            await browser.close()
+        results["test_4_playwright_siaf"] = {
+            "status":     "ok" if pasos.get("4b_wait_pwd", {}).get("status") == "ok" else "partial",
+            "pasos":      pasos,
+            "tiempo_seg": round(time.time() - t0_total, 2),
+        }
+    except Exception as e:
+        results["test_4_playwright_siaf"] = {
+            "status":     "fail",
+            "error":      f"{type(e).__name__}: {str(e)[:200]}",
+            "pasos":      pasos,
+            "tiempo_seg": round(time.time() - t0_total, 2),
+        }
+
+    return results
+
+
 @app.post("/consultar/batch", tags=["Batch"], dependencies=[Depends(verificar_api_key)])
 async def consultar_batch_ep(req: BatchRequest):
     """
