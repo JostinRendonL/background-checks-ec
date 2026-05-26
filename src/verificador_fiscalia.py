@@ -52,12 +52,37 @@ def _build_proxy_cfg() -> dict | None:
     return cfg
 
 _STEALTH_JS = """
+    // ── navigator props ─────────────────────────────────────────────
     Object.defineProperty(navigator, 'webdriver',          {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins',            {get: () => [1,2,3,4,5]});
+    Object.defineProperty(navigator, 'plugins',            {get: () => [
+        {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer'},
+        {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+        {name:'Native Client',     filename:'internal-nacl-plugin'}
+    ]});
     Object.defineProperty(navigator, 'languages',          {get: () => ['es-EC','es','en-US','en']});
     Object.defineProperty(navigator, 'platform',           {get: () => 'Win32'});
     Object.defineProperty(navigator, 'hardwareConcurrency',{get: () => 8});
+    Object.defineProperty(navigator, 'deviceMemory',       {get: () => 8});
+    Object.defineProperty(navigator, 'maxTouchPoints',     {get: () => 0});
+    Object.defineProperty(navigator, 'vendor',             {get: () => 'Google Inc.'});
+
+    // ── chrome runtime stub ─────────────────────────────────────────
     window.chrome = {runtime:{}, loadTimes:function(){}, csi:function(){}, app:{}};
+
+    // ── WebGL vendor/renderer (anti-fingerprint) ────────────────────
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) return 'Intel Inc.';                          // UNMASKED_VENDOR_WEBGL
+        if (parameter === 37446) return 'Intel Iris OpenGL Engine';            // UNMASKED_RENDERER_WEBGL
+        return getParameter.apply(this, [parameter]);
+    };
+
+    // ── permissions API consistencia ────────────────────────────────
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters);
 """
 
 _ROLES_SOSPECHOSO = {"SOSPECHOSO", "IMPUTADO", "PROCESADO", "ACUSADO", "SENTENCIADO", "INVESTIGADO"}
@@ -126,24 +151,45 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
 
 
 async def _consultar_en_page(cedula: str, page) -> dict:
-    # Warming: visitar primero la home para asentar cookies de Incapsula
-    # Timeout corto — si falla no importa, seguimos igual
+    """
+    Flujo: navegar + esperar challenge JS de Incapsula + reload si hace falta.
+
+    Incapsula sirve un iframe `_Incapsula_Resource` que ejecuta JS para
+    verificar el navegador. Si pasa el check, setea cookies y la pagina real
+    se renderiza. Damos tiempo al JS + reload para forzar refresh con cookies.
+    """
+    # Paso 1: goto con wait_until="commit" (solo headers, rapido)
+    await page.goto(_URL, wait_until="commit", timeout=_TIMEOUT_NAV)
+
+    # Paso 2: esperar el form #pwd hasta 20s; si aparece, perfecto
+    pwd_visible = False
     try:
-        await page.goto(
-            "https://www.gestiondefiscalias.gob.ec/",
-            wait_until="commit",      # solo espera headers, no DOM completo
-            timeout=_TIMEOUT_WARM,
-        )
-        await asyncio.sleep(1.5)
-    except Exception as e:
-        logger.warning(f"[FISCALIA] warming fallo (no critico): {e}")
+        await page.wait_for_selector("#pwd", state="visible", timeout=20_000)
+        pwd_visible = True
+        logger.info("[FISCALIA] #pwd aparecio en la primera carga (sin challenge)")
+    except PWTimeout:
+        logger.info("[FISCALIA] #pwd no aparecio en 20s, asumiendo challenge Incapsula")
 
-    await page.goto(_URL, wait_until="domcontentloaded", timeout=_TIMEOUT_NAV)
-    await asyncio.sleep(_SLEEP_INIT)
+    # Paso 3: si no apareció, probablemente estamos en el iframe de Incapsula
+    # Damos tiempo extra al JS del challenge para completar, luego reload
+    if not pwd_visible:
+        await asyncio.sleep(6)   # tiempo para que Incapsula JS termine
+        try:
+            await page.reload(wait_until="commit", timeout=_TIMEOUT_NAV)
+            await page.wait_for_selector("#pwd", state="visible", timeout=30_000)
+            pwd_visible = True
+            logger.info("[FISCALIA] #pwd aparecio despues del reload post-challenge")
+        except PWTimeout:
+            # Capturar HTML para debug
+            try:
+                body = await page.content()
+                has_incap = "incapsula" in body.lower() or "_incap_" in body.lower()
+                logger.warning(f"[FISCALIA] tras reload, #pwd no aparece. incapsula_en_body={has_incap}")
+            except Exception:
+                pass
+            return _vacio(error="Incapsula challenge no se resolvio (bot detection persistente)")
 
-    if await page.locator("#pwd").count() == 0:
-        return _vacio(error="Formulario no accesible (Incapsula bloqueó la IP)")
-
+    # Paso 4: llenar y submit
     await page.fill("#pwd", cedula)
     await asyncio.sleep(0.5)
     await page.click("#btn_buscar_denuncia")
