@@ -106,6 +106,7 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
             viewport={"width": 1366, "height": 768},
             locale="es-EC",
             timezone_id="America/Guayaquil",
+            ignore_https_errors=True,   # necesario para proxies con SSL interception (Bright Data)
             extra_http_headers={
                 "Accept-Language": "es-EC,es;q=0.9,en-US;q=0.8,en;q=0.7",
             },
