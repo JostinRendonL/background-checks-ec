@@ -38,6 +38,7 @@ load_dotenv(ROOT / ".env")
 from src.verificador_bachiller import consultar_cedula as verificar_bachiller
 from src.verificador_satje import consultar_satje
 from src.verificador_setec import consultar_setec
+from src.verificador_fiscalia import consultar_fiscalia
 from src.obs import init_sentry, capture_exception
 from src.metrics import setup_metrics
 
@@ -116,6 +117,7 @@ async def health(deep: bool = False):
             "bachiller": "activo",
             "satje":     "activo",
             "setec":     "activo",
+            "fiscalia":  "activo",
         },
         "concurrencia": SEMAPHORE_CONCURRENCIA,
     }
@@ -235,6 +237,23 @@ async def consultar_completo_ep(req: ConsultaRequest):
         "satje":      satje_res,
         "tiempo_seg": round(time.time() - t0, 2),
     }
+
+
+@app.post("/consultar/fiscalia", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
+async def consultar_fiscalia_ep(req: ConsultaRequest):
+    """
+    Consulta Noticias del Delito en el SIAF de la Fiscalia General del Estado.
+    Detecta si la persona aparece como sospechoso/procesado en causas penales
+    que aun no han llegado a juicio (y por lo tanto no aparecen en SATJE).
+    """
+    cedula = req.cedula.strip()
+    _validar_cedula(cedula)
+    logger.info(f"[API] /fiscalia -> {cedula}")
+    t0 = time.time()
+    async with _semaphore:
+        resultado = await consultar_fiscalia(cedula)
+    resultado["tiempo_seg"] = round(time.time() - t0, 2)
+    return resultado
 
 
 @app.post("/consultar/batch", tags=["Batch"], dependencies=[Depends(verificar_api_key)])
