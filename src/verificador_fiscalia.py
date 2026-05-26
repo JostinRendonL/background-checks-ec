@@ -39,8 +39,12 @@ _TIMEOUT_RES    = 18_000
 _SLEEP_INIT     = 3.0
 _SLEEP_CLICK    = 4.0
 
-# Proxy residencial (recomendado: Ecuador / LATAM) — opcional
-# Formato URL: http://user:pass@host:port  o  socks5://user:pass@host:port
+# ── Estrategia de conexion (orden de preferencia) ────────────────────────────
+# 1. Browser API (Bright Data Scraping Browser) — wss://... con anti-bot integrado
+# 2. Proxy residencial — http(s):// con stealth manual
+# 3. Sin proxy — solo para dev local
+_BROWSER_API_URL = os.getenv("FISCALIA_BROWSER_API_URL", "").strip()
+
 _PROXY_URL  = os.getenv("FISCALIA_PROXY_URL", "").strip()
 _PROXY_USER = os.getenv("FISCALIA_PROXY_USER", "").strip()
 _PROXY_PASS = os.getenv("FISCALIA_PROXY_PASS", "").strip()
@@ -98,33 +102,48 @@ _ROLES_NEUTROS    = {"DENUNCIANTE", "VICTIMA", "OFENDIDO", "TESTIGO", "AGRAVIADO
 _MAX_INTENTOS = 3   # Bright Data rota IPs; reintentar con nueva sesion = nueva IP
 _TIMEOUT_PWD_INICIAL = 12_000   # primer intento al form (rapido si la IP esta limpia)
 _TIMEOUT_PWD_RELOAD  = 18_000   # segundo intento despues del reload (post-challenge)
+# Con Browser API el bypass es mucho mejor: menos intentos necesarios + form aparece directo
+_TIMEOUT_PWD_BROWSER_API = 45_000   # Browser API resuelve challenges internamente
 
 
 async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
     """
     Consulta la cedula en el SIAF de la Fiscalia General del Estado.
 
-    Hasta _MAX_INTENTOS reintentos con browsers nuevos. Cada browser nuevo
-    obtiene una IP nueva del proxy rotativo (Bright Data Residencial), lo
-    que sube el rate de exito ante el bot-detection de Incapsula.
+    Estrategia:
+    - Si FISCALIA_BROWSER_API_URL esta seteado -> usa Bright Data Browser API
+      (Scraping Browser remoto con anti-bot integrado, max 2 intentos).
+    - Si no -> usa proxy residencial + Playwright local con stealth
+      (hasta _MAX_INTENTOS intentos con browsers nuevos para rotar IP).
     """
     cedula = (cedula or "").strip()
     logger.info(f"[FISCALIA] Consultando cedula: {cedula}")
 
-    proxy_cfg = _build_proxy_cfg()
-    if proxy_cfg:
-        logger.info(f"[FISCALIA] Usando proxy residencial: {proxy_cfg['server']}")
+    # Browser API tiene mejor tasa de exito y menos overhead -> menos intentos
+    usando_browser_api = bool(_BROWSER_API_URL)
+    if usando_browser_api:
+        max_intentos = 2
+        logger.info(f"[FISCALIA] Modo: Browser API (Bright Data Scraping Browser)")
+    else:
+        proxy_cfg = _build_proxy_cfg()
+        max_intentos = _MAX_INTENTOS
+        if proxy_cfg:
+            logger.info(f"[FISCALIA] Modo: Proxy residencial -> {proxy_cfg['server']}")
+        else:
+            logger.info(f"[FISCALIA] Modo: directo (sin proxy)")
 
     ultimo_error = "sin intentos"
-    for intento in range(1, _MAX_INTENTOS + 1):
-        logger.info(f"[FISCALIA] Intento {intento}/{_MAX_INTENTOS}")
+    for intento in range(1, max_intentos + 1):
+        logger.info(f"[FISCALIA] Intento {intento}/{max_intentos}")
         try:
-            result = await _intentar_consulta(cedula, proxy_cfg)
+            if usando_browser_api:
+                result = await _intentar_browser_api(cedula)
+            else:
+                result = await _intentar_proxy(cedula, _build_proxy_cfg())
         except Exception as exc:
             logger.error(f"[FISCALIA] Intento {intento} excepcion: {exc}")
             result = _vacio(error=str(exc)[:200])
 
-        # Exito si no hay error o si hay noticias
         if result.get("error") is None or result.get("total_noticias", 0) > 0:
             if intento > 1:
                 logger.info(f"[FISCALIA] Exito en intento {intento}")
@@ -132,17 +151,35 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
 
         ultimo_error = result.get("error", "desconocido")
         logger.warning(f"[FISCALIA] Intento {intento} fallo: {ultimo_error}")
-
-        # Esperar entre intentos para que rotacion de IP haga efecto
-        if intento < _MAX_INTENTOS:
+        if intento < max_intentos:
             await asyncio.sleep(3)
 
-    # Todos los intentos fallaron
-    return _vacio(error=f"Tras {_MAX_INTENTOS} intentos: {ultimo_error}")
+    return _vacio(error=f"Tras {max_intentos} intentos: {ultimo_error}")
 
 
-async def _intentar_consulta(cedula: str, proxy_cfg: dict | None) -> dict:
-    """Un intento de consulta con browser fresco (nueva IP del proxy rotativo)."""
+async def _intentar_browser_api(cedula: str) -> dict:
+    """
+    Conecta a Bright Data Browser API (Scraping Browser).
+    El browser remoto tiene anti-bot integrado: bypassa Incapsula
+    automaticamente, resuelve CAPTCHAs si los hay, rota IPs internamente.
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(_BROWSER_API_URL)
+        try:
+            # Browser API ya viene con contexto residencial, solo creamos page
+            ctx = await browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                locale="es-EC",
+                ignore_https_errors=True,
+            )
+            page = await ctx.new_page()
+            return await _consultar_en_page_browser_api(cedula, page)
+        finally:
+            await browser.close()
+
+
+async def _intentar_proxy(cedula: str, proxy_cfg: dict | None) -> dict:
+    """Fallback: Playwright local + proxy residencial + stealth manual."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
@@ -182,6 +219,27 @@ async def _intentar_consulta(cedula: str, proxy_cfg: dict | None) -> dict:
             return await _consultar_en_page(cedula, page)
         finally:
             await browser.close()
+
+
+async def _consultar_en_page_browser_api(cedula: str, page) -> dict:
+    """
+    Flujo simplificado para Browser API: el unlock JS lo maneja Bright Data
+    internamente, asi que confiamos en que la pagina llegue lista.
+    Solo esperamos el form y operamos.
+    """
+    await page.goto(_URL, wait_until="domcontentloaded", timeout=_TIMEOUT_NAV)
+
+    try:
+        await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_BROWSER_API)
+    except PWTimeout:
+        return _vacio(error="Browser API: #pwd no aparecio en 45s (sitio caido o cambio de DOM)")
+
+    await page.fill("#pwd", cedula)
+    await asyncio.sleep(0.5)
+    await page.click("#btn_buscar_denuncia")
+    await asyncio.sleep(_SLEEP_CLICK)
+
+    return await _parsear_resultados(cedula, page)
 
 
 async def _consultar_en_page(cedula: str, page) -> dict:
