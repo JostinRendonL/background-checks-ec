@@ -41,6 +41,10 @@ from src.verificador_setec import consultar_setec
 from src.verificador_fiscalia import consultar_fiscalia
 from src.obs import init_sentry, capture_exception
 from src.metrics import setup_metrics
+from src.cache_redis import (
+    cache_get, cache_set, cache_stats as redis_cache_stats,
+    close as close_cache,
+)
 
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="bg-api")
@@ -159,52 +163,65 @@ async def health(deep: bool = False):
     return {**base, "status": overall, "deps": deps}
 
 
+async def _consultar_con_cache(tipo: str, cedula: str, ejecutar_fn) -> dict:
+    """
+    Helper genérico: chequea cache Redis → si hit devuelve. Si miss ejecuta
+    la función real (con semaphore), guarda en cache, y devuelve.
+    `ejecutar_fn` es una coroutine async sin args que hace el trabajo real.
+    """
+    # 1. Probar cache
+    cached = await cache_get(tipo, cedula)
+    if cached is not None:
+        cached["_cache_hit"] = True
+        cached["tiempo_seg"] = 0.0
+        return cached
+
+    # 2. Cache miss → ejecutar el scraper real
+    t0 = time.time()
+    async with _semaphore:
+        resultado = await ejecutar_fn()
+    resultado["tiempo_seg"] = round(time.time() - t0, 2)
+    resultado["_cache_hit"] = False
+
+    # 3. Guardar en cache (no bloquea si Redis está caído)
+    await cache_set(tipo, cedula, resultado)
+    return resultado
+
+
 @app.post("/consultar/bachiller", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
 async def consultar_bachiller_ep(req: ConsultaRequest):
-    """
-    Verifica si la persona tiene título de bachiller registrado
-    en el Ministerio de Educación.
-    """
+    """Verifica título de bachiller en el Ministerio de Educación."""
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
     logger.info(f"[API] /bachiller → {cedula}")
-    t0 = time.time()
-    async with _semaphore:
-        resultado = await asyncio.to_thread(verificar_bachiller, cedula)
-    resultado["tiempo_seg"] = round(time.time() - t0, 2)
-    return resultado
+    return await _consultar_con_cache(
+        "bachiller", cedula,
+        lambda: asyncio.to_thread(verificar_bachiller, cedula),
+    )
 
 
 @app.post("/consultar/satje", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
 async def consultar_satje_ep(req: ConsultaRequest):
-    """
-    Verifica procesos judiciales en el sistema SATJE de la Función Judicial.
-    Busca la cédula como demandado/procesado y como actor/ofendido.
-    """
+    """Verifica procesos judiciales en SATJE de la Función Judicial."""
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
     logger.info(f"[API] /satje → {cedula}")
-    t0 = time.time()
-    async with _semaphore:
-        resultado = await consultar_satje(cedula)
-    resultado["tiempo_seg"] = round(time.time() - t0, 2)
-    return resultado
+    return await _consultar_con_cache(
+        "satje", cedula,
+        lambda: consultar_satje(cedula),
+    )
 
 
 @app.post("/consultar/setec", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
 async def consultar_setec_ep(req: ConsultaRequest):
-    """
-    Verifica certificaciones de capacitación registradas en el SETEC
-    (Ministerio de Trabajo).
-    """
+    """Verifica certificaciones de capacitación SETEC (Min. del Trabajo)."""
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
     logger.info(f"[API] /setec → {cedula}")
-    t0 = time.time()
-    async with _semaphore:
-        resultado = await consultar_setec(cedula)
-    resultado["tiempo_seg"] = round(time.time() - t0, 2)
-    return resultado
+    return await _consultar_con_cache(
+        "setec", cedula,
+        lambda: consultar_setec(cedula),
+    )
 
 
 @app.post("/consultar/completo", tags=["Verificaciones"], dependencies=[Depends(verificar_api_key)])
@@ -212,18 +229,30 @@ async def consultar_completo_ep(req: ConsultaRequest):
     """
     Ejecuta bachiller + SATJE en paralelo. SETEC se consulta por separado
     via /consultar/setec para no bloquear el resultado principal.
+    Aprovecha cache Redis por sub-resultado: si bachiller ya está cacheado,
+    no se vuelve a scrapear (mismo con SATJE).
     """
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
     logger.info(f"[API] /completo → {cedula}")
     t0 = time.time()
 
-    async with _semaphore:
-        resultados = await asyncio.gather(
-            asyncio.to_thread(verificar_bachiller, cedula),
-            consultar_satje(cedula),
-            return_exceptions=True,
+    # Wrapper: cache hit o ejecuta el scraper para cada uno
+    async def get_bachiller():
+        return await _consultar_con_cache(
+            "bachiller", cedula,
+            lambda: asyncio.to_thread(verificar_bachiller, cedula),
         )
+
+    async def get_satje():
+        return await _consultar_con_cache(
+            "satje", cedula,
+            lambda: consultar_satje(cedula),
+        )
+
+    resultados = await asyncio.gather(
+        get_bachiller(), get_satje(), return_exceptions=True,
+    )
 
     bachiller_res = resultados[0] if not isinstance(resultados[0], Exception) else {"estado": "ERROR", "detalle": str(resultados[0])}
     satje_res     = resultados[1] if not isinstance(resultados[1], Exception) else {"status": "ERROR", "detalle": str(resultados[1])}
@@ -249,11 +278,10 @@ async def consultar_fiscalia_ep(req: ConsultaRequest):
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
     logger.info(f"[API] /fiscalia -> {cedula}")
-    t0 = time.time()
-    async with _semaphore:
-        resultado = await consultar_fiscalia(cedula)
-    resultado["tiempo_seg"] = round(time.time() - t0, 2)
-    return resultado
+    return await _consultar_con_cache(
+        "fiscalia", cedula,
+        lambda: consultar_fiscalia(cedula),
+    )
 
 
 @app.get("/diagnostico/fiscalia", tags=["Diagnostico"], dependencies=[Depends(verificar_api_key)])
@@ -544,3 +572,20 @@ def _calcular_semaforo(bachiller: dict, satje: dict) -> str:
     if sin_bachiller or tiene_causas_actor:
         return "AMARILLO"
     return "VERDE"
+
+
+# ── Cache management ─────────────────────────────────────────────────────────
+
+@app.get("/cache/stats", tags=["Sistema"], dependencies=[Depends(verificar_api_key)])
+async def cache_stats_ep():
+    """Estadísticas del cache Redis: total de keys, keys por tipo, memoria usada."""
+    return await redis_cache_stats()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cerrar conexiones limpias al apagar el servicio."""
+    try:
+        await close_cache()
+    except Exception:
+        pass
