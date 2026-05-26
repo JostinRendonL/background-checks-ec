@@ -95,20 +95,18 @@ _ROLES_SOSPECHOSO = {"SOSPECHOSO", "IMPUTADO", "PROCESADO", "ACUSADO", "SENTENCI
 _ROLES_NEUTROS    = {"DENUNCIANTE", "VICTIMA", "OFENDIDO", "TESTIGO", "AGRAVIADO"}
 
 
+_MAX_INTENTOS = 3   # Bright Data rota IPs; reintentar con nueva sesion = nueva IP
+_TIMEOUT_PWD_INICIAL = 12_000   # primer intento al form (rapido si la IP esta limpia)
+_TIMEOUT_PWD_RELOAD  = 18_000   # segundo intento despues del reload (post-challenge)
+
+
 async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
     """
     Consulta la cedula en el SIAF de la Fiscalia General del Estado.
 
-    Returns:
-        {
-            "error":              None | str,
-            "tiene_antecedentes": bool,
-            "noticias":           list[dict],
-            "como_sospechoso":    int,
-            "como_denunciante":   int,
-            "total_noticias":     int,
-            "delitos":            list[str],
-        }
+    Hasta _MAX_INTENTOS reintentos con browsers nuevos. Cada browser nuevo
+    obtiene una IP nueva del proxy rotativo (Bright Data Residencial), lo
+    que sube el rate de exito ante el bot-detection de Incapsula.
     """
     cedula = (cedula or "").strip()
     logger.info(f"[FISCALIA] Consultando cedula: {cedula}")
@@ -117,6 +115,34 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
     if proxy_cfg:
         logger.info(f"[FISCALIA] Usando proxy residencial: {proxy_cfg['server']}")
 
+    ultimo_error = "sin intentos"
+    for intento in range(1, _MAX_INTENTOS + 1):
+        logger.info(f"[FISCALIA] Intento {intento}/{_MAX_INTENTOS}")
+        try:
+            result = await _intentar_consulta(cedula, proxy_cfg)
+        except Exception as exc:
+            logger.error(f"[FISCALIA] Intento {intento} excepcion: {exc}")
+            result = _vacio(error=str(exc)[:200])
+
+        # Exito si no hay error o si hay noticias
+        if result.get("error") is None or result.get("total_noticias", 0) > 0:
+            if intento > 1:
+                logger.info(f"[FISCALIA] Exito en intento {intento}")
+            return result
+
+        ultimo_error = result.get("error", "desconocido")
+        logger.warning(f"[FISCALIA] Intento {intento} fallo: {ultimo_error}")
+
+        # Esperar entre intentos para que rotacion de IP haga efecto
+        if intento < _MAX_INTENTOS:
+            await asyncio.sleep(3)
+
+    # Todos los intentos fallaron
+    return _vacio(error=f"Tras {_MAX_INTENTOS} intentos: {ultimo_error}")
+
+
+async def _intentar_consulta(cedula: str, proxy_cfg: dict | None) -> dict:
+    """Un intento de consulta con browser fresco (nueva IP del proxy rotativo)."""
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
@@ -138,7 +164,7 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
             viewport={"width": 1366, "height": 768},
             locale="es-EC",
             timezone_id="America/Guayaquil",
-            ignore_https_errors=True,   # necesario para proxies con SSL interception (Bright Data)
+            ignore_https_errors=True,
             extra_http_headers={
                 "Accept-Language": "es-EC,es;q=0.9,en-US;q=0.8,en;q=0.7",
             },
@@ -146,24 +172,16 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
         await ctx.add_init_script(_STEALTH_JS)
         page = await ctx.new_page()
 
-        # Aplicar playwright-stealth (cubre TLS, audio, canvas, fonts, etc)
-        # Mucho mas completo que nuestro _STEALTH_JS manual
         if _HAS_STEALTH_LIB:
             try:
                 await stealth_async(page)
-                logger.info("[FISCALIA] playwright-stealth aplicado")
             except Exception as e:
                 logger.warning(f"[FISCALIA] stealth_async fallo (no critico): {e}")
 
         try:
-            result = await _consultar_en_page(cedula, page)
-        except Exception as exc:
-            logger.error(f"[FISCALIA] Error: {exc}")
-            result = _vacio(error=str(exc)[:200])
+            return await _consultar_en_page(cedula, page)
         finally:
             await browser.close()
-
-    return result
 
 
 async def _consultar_en_page(cedula: str, page) -> dict:
@@ -177,24 +195,24 @@ async def _consultar_en_page(cedula: str, page) -> dict:
     # Paso 1: goto con wait_until="commit" (solo headers, rapido)
     await page.goto(_URL, wait_until="commit", timeout=_TIMEOUT_NAV)
 
-    # Paso 2: esperar el form #pwd hasta 20s; si aparece, perfecto
+    # Paso 2: esperar el form #pwd; si aparece rapido, perfecto
     pwd_visible = False
     try:
-        await page.wait_for_selector("#pwd", state="visible", timeout=20_000)
+        await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_INICIAL)
         pwd_visible = True
-        logger.info("[FISCALIA] #pwd aparecio en la primera carga (sin challenge)")
+        logger.info("[FISCALIA] #pwd aparecio sin challenge")
     except PWTimeout:
-        logger.info("[FISCALIA] #pwd no aparecio en 20s, asumiendo challenge Incapsula")
+        logger.info("[FISCALIA] #pwd no aparecio, intentando reload post-challenge")
 
     # Paso 3: si no apareció, probablemente estamos en el iframe de Incapsula
     # Damos tiempo extra al JS del challenge para completar, luego reload
     if not pwd_visible:
-        await asyncio.sleep(6)   # tiempo para que Incapsula JS termine
+        await asyncio.sleep(4)   # tiempo para que Incapsula JS termine
         try:
             await page.reload(wait_until="commit", timeout=_TIMEOUT_NAV)
-            await page.wait_for_selector("#pwd", state="visible", timeout=30_000)
+            await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_RELOAD)
             pwd_visible = True
-            logger.info("[FISCALIA] #pwd aparecio despues del reload post-challenge")
+            logger.info("[FISCALIA] #pwd aparecio post-reload")
         except PWTimeout:
             # Capturar HTML para debug
             try:
