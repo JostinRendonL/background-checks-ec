@@ -586,22 +586,35 @@ async def cache_stats_ep():
 
 @app.get("/pool/stats", tags=["Sistema"], dependencies=[Depends(verificar_api_key)])
 async def pool_stats_ep():
-    """Estado del pool de browsers Chromium pre-calentados."""
+    """Estado de los pools de browsers Chromium pre-calentados."""
     from src.verificador_fiscalia import get_fiscalia_pool
-    return {"fiscalia": get_fiscalia_pool().stats()}
+    from src.verificador_setec import get_setec_pool
+    return {
+        "fiscalia": get_fiscalia_pool().stats(),
+        "setec":    get_setec_pool().stats(),
+    }
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Pre-calentar el pool de browsers para Fiscalía al arrancar."""
+    """Pre-calentar pools de browsers (Fiscalia + SETEC) al arrancar."""
     if os.getenv("BROWSER_POOL_EAGER_START", "1") == "1":
+        # Inicializacion secuencial: evita race condition en async_playwright().start()
         try:
             from src.verificador_fiscalia import get_fiscalia_pool
-            logger.info("[STARTUP] Pre-calentando pool de browsers Fiscalia...")
+            logger.info("[STARTUP] Pre-calentando pool Fiscalia...")
             await get_fiscalia_pool().start()
             logger.info("[STARTUP] Pool Fiscalia listo")
         except Exception as e:
-            logger.error(f"[STARTUP] Error inicializando pool: {e}")
+            logger.error(f"[STARTUP] Error inicializando pool Fiscalia: {e}")
+
+        try:
+            from src.verificador_setec import get_setec_pool
+            logger.info("[STARTUP] Pre-calentando pool SETEC...")
+            await get_setec_pool().start()
+            logger.info("[STARTUP] Pool SETEC listo")
+        except Exception as e:
+            logger.error(f"[STARTUP] Error inicializando pool SETEC: {e}")
 
 
 @app.on_event("shutdown")
@@ -614,5 +627,10 @@ async def shutdown_event():
     try:
         from src.verificador_fiscalia import get_fiscalia_pool
         await get_fiscalia_pool().shutdown()
+    except Exception:
+        pass
+    try:
+        from src.verificador_setec import get_setec_pool
+        await get_setec_pool().shutdown()
     except Exception:
         pass

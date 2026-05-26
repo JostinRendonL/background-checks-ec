@@ -43,6 +43,33 @@ _HEADERS_IGNORAR = {
 
 # ── Función pública (autónoma) ────────────────────────────────────────────────
 
+# ── Pool singleton de browsers SETEC ────────────────────────────────────────
+# Evita race condition de uvloop al hacer async_playwright().start() en cada
+# request (manifestaba "Racing with another loop to spawn a process" con
+# 2+ consultas concurrentes).
+from src.browser_pool import BrowserPool
+import os
+
+_setec_pool: BrowserPool | None = None
+
+
+def get_setec_pool() -> BrowserPool:
+    """Pool singleton de browsers para SETEC (sin proxy, conexion directa)."""
+    global _setec_pool
+    if _setec_pool is None:
+        size = int(os.getenv("SETEC_POOL_SIZE", "3"))
+        _setec_pool = BrowserPool(
+            size=size,
+            launch_kwargs={
+                "headless": True,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            },
+            max_uses_per_browser=50,
+            name="setec",
+        )
+    return _setec_pool
+
+
 async def consultar_setec(cedula: str) -> dict[str, Any]:
     """
     Consulta certificaciones SETEC para una cédula.
@@ -58,8 +85,10 @@ async def consultar_setec(cedula: str) -> dict[str, Any]:
     cedula = (cedula or "").strip()
     logger.info(f"[SETEC] Consultando cédula: {cedula}")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+    pool = get_setec_pool()
+    browser = await pool.acquire(timeout=60.0)
+    ctx = None
+    try:
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,12 +97,14 @@ async def consultar_setec(cedula: str) -> dict[str, Any]:
             )
         )
         page = await ctx.new_page()
-        try:
-            resultado = await _consultar_en_page(cedula, page)
-        finally:
-            await browser.close()
-
-    return resultado
+        return await _consultar_en_page(cedula, page)
+    finally:
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        await pool.release(browser)
 
 
 # ── Función con page externo (para reutilizar browser) ────────────────────────
