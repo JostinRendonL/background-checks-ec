@@ -26,7 +26,57 @@ _USER_AGENT = (
 
 # ── Resolución de captcha ─────────────────────────────────────────────────────
 
-def _resolver_captcha(img_b64: str) -> str:
+_TWOCAPTCHA_KEY = os.getenv("TWOCAPTCHA_API_KEY", "").strip()
+
+
+def _resolver_captcha_2captcha(img_b64: str) -> str:
+    """
+    Resuelve captcha via 2Captcha (servicio humano, sin rate limits).
+    Costo: ~$0.001 por captcha. Tiempo: 5-15 seg.
+    """
+    import time
+
+    # 1. Enviar imagen a la cola
+    r = httpx.post(
+        "https://2captcha.com/in.php",
+        data={
+            "key":    _TWOCAPTCHA_KEY,
+            "method": "base64",
+            "body":   img_b64,
+            "json":   "1",
+        },
+        timeout=15.0,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != 1:
+        raise ValueError(f"2Captcha rechazo: {data.get('request')}")
+    task_id = data["request"]
+
+    # 2. Esperar resolución (poll cada 5 seg, max 60 seg)
+    for _ in range(12):
+        time.sleep(5)
+        r2 = httpx.get(
+            "https://2captcha.com/res.php",
+            params={"key": _TWOCAPTCHA_KEY, "action": "get",
+                    "id": task_id, "json": "1"},
+            timeout=10.0,
+        )
+        r2.raise_for_status()
+        d2 = r2.json()
+        if d2.get("status") == 1:
+            return d2["request"].strip()
+        if d2.get("request") != "CAPCHA_NOT_READY":
+            raise ValueError(f"2Captcha error: {d2.get('request')}")
+
+    raise TimeoutError("2Captcha no respondió en 60 segundos")
+
+
+def _resolver_captcha_openrouter(img_b64: str) -> str:
+    """
+    Fallback: resuelve captcha via Gemini 2.0 Flash en OpenRouter.
+    Puede dar 429 si hay muchas llamadas en poco tiempo.
+    """
     resp = httpx.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -66,6 +116,19 @@ def _resolver_captcha(img_b64: str) -> str:
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def _resolver_captcha(img_b64: str) -> str:
+    """
+    Usa 2Captcha si la key está configurada (preferido — sin rate limits).
+    Cae a OpenRouter (Gemini) si no hay key de 2Captcha.
+    """
+    if _TWOCAPTCHA_KEY:
+        try:
+            return _resolver_captcha_2captcha(img_b64)
+        except Exception as e:
+            print(f"[captcha] 2Captcha falló ({e}), usando OpenRouter como fallback")
+    return _resolver_captcha_openrouter(img_b64)
 
 
 # ── Selectores con fallback (JSF no garantiza IDs estáticos) ─────────────────
