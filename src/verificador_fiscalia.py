@@ -175,8 +175,18 @@ def _parsear_bloque(numero: str, bloque: str) -> dict:
     else:
         delito = ""
 
-    lugar_m = re.search(r"([A-Z\xc1\xc9\xcd\xd3\xda][A-Z\xc1\xc9\xcd\xd3\xda\s]+ - [A-Z\xc1\xc9\xcd\xd3\xda][A-Z\xc1\xc9\xcd\xd3\xda\s]+)", texto)
-    lugar = lugar_m.group(1).strip() if lugar_m else ""
+    # Lugar: "PROVINCIA - CIUDAD" — evitar capturar labels HTML como "LUGAR" o "FECHA"
+    lugar_m = re.search(r"\b([A-Z\xc1\xc9\xcd\xd3\xda\xd1][A-Z\xc1\xc9\xcd\xd3\xda\xd1\s]{2,20})\s+-\s+([A-Z\xc1\xc9\xcd\xd3\xda\xd1][A-Z\xc1\xc9\xcd\xd3\xda\xd1\s]{2,20})\b", texto)
+    if lugar_m:
+        parte1 = lugar_m.group(1).strip().rstrip()
+        parte2 = lugar_m.group(2).strip()
+        # Limpiar palabras-label comunes que pueden colarse
+        for label in ("LUGAR", "FECHA", "HORA", "ESTADO", "DELITO", "UNIDAD"):
+            parte1 = parte1.replace(label, "").strip()
+            parte2 = parte2.replace(label, "").strip()
+        lugar = f"{parte1} - {parte2}".strip(" -")
+    else:
+        lugar = ""
 
     return {"numero": numero, "fecha": fecha, "delito": delito, "lugar": lugar, "rol": ""}
 
