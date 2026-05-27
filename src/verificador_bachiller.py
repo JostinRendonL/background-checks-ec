@@ -262,7 +262,6 @@ def _intentar_consulta(page, cedula: str, num: str) -> dict | None:
     Devuelve el resultado o None si el captcha fue rechazado.
     """
     page.goto(MINISTERIO_URL, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_load_state("networkidle", timeout=30_000)
 
     img_captcha = page.locator(
         "img[src*='Captcha'], img[src*='captcha'], img[src*='kaptcha']"
@@ -278,7 +277,7 @@ def _intentar_consulta(page, cedula: str, num: str) -> dict | None:
     _boton_buscar(page).click()
 
     try:
-        page.wait_for_load_state("networkidle", timeout=20_000)
+        page.wait_for_load_state("domcontentloaded", timeout=20_000)
     except PlaywrightTimeout:
         pass
 
@@ -348,6 +347,26 @@ def _consultar_cedula_impl(cedula: str, max_intentos: int = 4) -> dict:
         )
         context = browser.new_context(user_agent=_USER_AGENT)
         page = context.new_page()
+
+        # Bloquear recursos innecesarios para ahorrar ancho de banda del proxy.
+        # Se permite: document, script (JSF lo necesita), xhr/fetch (AJAX), y
+        # las imágenes cuya URL contiene 'captcha'/'kaptcha' (imagen del CAPTCHA).
+        # Se bloquea: stylesheet, font, media, e imágenes decorativas.
+        def _filtrar_recurso(route, request):
+            rt = request.resource_type
+            if rt in ("stylesheet", "font", "media"):
+                route.abort()
+                return
+            if rt == "image":
+                url = request.url.lower()
+                if any(k in url for k in ("captcha", "kaptcha")):
+                    route.continue_()
+                else:
+                    route.abort()
+                return
+            route.continue_()
+
+        page.route("**/*", _filtrar_recurso)
 
         try:
             # ── Fase 1: obtener un resultado inicial ──────────────────────────
