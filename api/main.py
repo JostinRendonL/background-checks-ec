@@ -43,6 +43,7 @@ from src.obs import init_sentry, capture_exception
 from src.metrics import setup_metrics
 from src.cache_redis import (
     cache_get, cache_set, cache_stats as redis_cache_stats,
+    cache_invalidate, cache_invalidate_tipo,
     close as close_cache,
 )
 
@@ -580,6 +581,28 @@ def _calcular_semaforo(bachiller: dict, satje: dict) -> str:
 async def cache_stats_ep():
     """Estadísticas del cache Redis: total de keys, keys por tipo, memoria usada."""
     return await redis_cache_stats()
+
+
+@app.post("/cache/invalidate/{tipo}", tags=["Sistema"], dependencies=[Depends(verificar_api_key)])
+async def cache_invalidate_tipo_ep(tipo: str):
+    """
+    Borra todas las entradas cacheadas de un tipo. Útil tras un bug fix que
+    cambia interpretación de datos (ej. parser de rol Fiscalía actualizado).
+    Tipos válidos: bachiller, satje, setec, fiscalia, completo
+    """
+    if tipo not in ("bachiller", "satje", "setec", "fiscalia", "completo"):
+        raise HTTPException(status_code=400, detail=f"Tipo inválido: {tipo}")
+    deleted = await cache_invalidate_tipo(tipo)
+    return {"tipo": tipo, "keys_deleted": deleted}
+
+
+@app.post("/cache/invalidate/{tipo}/{cedula}", tags=["Sistema"], dependencies=[Depends(verificar_api_key)])
+async def cache_invalidate_cedula_ep(tipo: str, cedula: str):
+    """Borra una entrada cacheada específica (por tipo + cédula)."""
+    if tipo not in ("bachiller", "satje", "setec", "fiscalia", "completo"):
+        raise HTTPException(status_code=400, detail=f"Tipo inválido: {tipo}")
+    await cache_invalidate(tipo, cedula)
+    return {"tipo": tipo, "cedula": cedula, "invalidated": True}
 
 
 # ── Browser pool management ──────────────────────────────────────────────────

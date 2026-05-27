@@ -143,6 +143,29 @@ async def cache_invalidate(tipo: str, cedula: str) -> None:
         logger.warning(f"[CACHE INVALIDATE] error en {tipo}:{cedula}: {e}")
 
 
+async def cache_invalidate_tipo(tipo: str) -> int:
+    """
+    Borra TODAS las entradas de un tipo. Util para forzar re-scrape masivo
+    despues de un bug fix que cambia la interpretacion de los datos.
+    Devuelve cantidad de keys borradas.
+    """
+    client = _get_client()
+    if client is None:
+        return 0
+    try:
+        pattern = f"{_KEY_PREFIX}:{tipo}:*"
+        deleted = 0
+        # Iterar y borrar en batches
+        async for key in client.scan_iter(match=pattern, count=500):
+            await client.delete(key)
+            deleted += 1
+        logger.info(f"[CACHE INVALIDATE TIPO] {tipo}: {deleted} keys borradas")
+        return deleted
+    except Exception as e:
+        logger.warning(f"[CACHE INVALIDATE TIPO] error en {tipo}: {e}")
+        return 0
+
+
 async def cache_stats() -> dict[str, Any]:
     """Stats del cache para el endpoint de diagnóstico."""
     client = _get_client()
