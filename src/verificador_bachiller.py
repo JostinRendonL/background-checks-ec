@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # default es seguro (2 procesos Chromium tibios cabe en RAM y no race).
 # Configurable con BACHILLER_CONCURRENCY env var.
 _BACHILLER_SEMAPHORE = threading.Semaphore(
-    int(os.getenv("BACHILLER_CONCURRENCY", "2"))
+    int(os.getenv("BACHILLER_CONCURRENCY", "3"))
 )
 
 MINISTERIO_URL = (
