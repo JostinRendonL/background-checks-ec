@@ -130,8 +130,23 @@ _STEALTH_JS = """
             : originalQuery(parameters);
 """
 
-_ROLES_SOSPECHOSO = {"SOSPECHOSO", "IMPUTADO", "PROCESADO", "ACUSADO", "SENTENCIADO", "INVESTIGADO"}
-_ROLES_NEUTROS    = {"DENUNCIANTE", "VICTIMA", "OFENDIDO", "TESTIGO", "AGRAVIADO"}
+_ROLES_SOSPECHOSO = {
+    "SOSPECHOSO", "SOSPECHOSA",
+    "IMPUTADO", "IMPUTADA",
+    "PROCESADO", "PROCESADA",
+    "ACUSADO", "ACUSADA",
+    "SENTENCIADO", "SENTENCIADA",
+    "INVESTIGADO", "INVESTIGADA",
+}
+_ROLES_NEUTROS = {
+    "DENUNCIANTE",
+    "VICTIMA", "VÍCTIMA",
+    "OFENDIDO", "OFENDIDA",
+    "TESTIGO",
+    "AGRAVIADO", "AGRAVIADA",
+    "PERJUDICADO", "PERJUDICADA",   # ← NUEVO (caso de estafa)
+    "AFECTADO", "AFECTADA",         # ← preventivo
+}
 
 
 _MAX_INTENTOS = 3   # Bright Data rota IPs; reintentar con nueva sesion = nueva IP
@@ -361,6 +376,8 @@ async def _parsear_resultados(cedula: str, page) -> dict:
                 delitos.append(d)
         elif rol in _ROLES_NEUTROS:
             como_denunciante += 1
+        # Si rol == "DESCONOCIDO", no contamos en ninguna categoría
+        # → cae en OBSERVACIÓN en el semáforo (revisión manual)
 
     return {
         "error":              None,
@@ -403,18 +420,62 @@ def _parsear_bloque(numero: str, bloque: str) -> dict:
 
 
 def _buscar_rol_cedula(cedula: str, bloque_html: str) -> str | None:
-    idx = bloque_html.find(cedula)
-    if idx < 0:
-        return None
+    """
+    Busca el rol del sujeto cuya cédula coincide, parseando filas <tr>
+    de la tabla SUJETOS exactamente. NO usa fragmento de N chars (que
+    contaminaba con filas vecinas tipo "SOSPECHOSOS POR IDENTIFICAR").
 
-    fragmento = bloque_html[idx: idx + 400]
-    fragmento_txt = re.sub(r"<[^>]+>", " ", fragmento).upper()
+    Devuelve:
+      - SOSPECHOSO/IMPUTADO/PROCESADO/... si se encontró un rol acusatorio
+      - DENUNCIANTE/VICTIMA/PERJUDICADO/... si se encontró un rol neutro
+      - "DESCONOCIDO" si la cédula está en una fila pero no se identifica el rol
+      - None si la cédula no aparece en ninguna fila de esta noticia
+    """
+    # Buscar todas las filas <tr> de la tabla
+    tr_pattern = re.compile(r'<tr\b[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
+    cedula_escape = re.escape(cedula)
+    # Boundary: la cédula debe ser palabra completa (no substring de otra)
+    cedula_re = re.compile(rf'(?<!\d){cedula_escape}(?!\d)')
 
-    for rol in list(_ROLES_SOSPECHOSO) + list(_ROLES_NEUTROS):
-        if rol in fragmento_txt:
-            return rol
+    encontrado_alguna_fila = False
+    rol_mas_grave = None   # SOSPECHOSO > NEUTRO > DESCONOCIDO
 
-    return "SOSPECHOSO"
+    for tr_match in tr_pattern.finditer(bloque_html):
+        tr_content = tr_match.group(1)
+        # Texto limpio de la fila (sin tags, whitespace normalizado)
+        tr_text = re.sub(r"<[^>]+>", " ", tr_content)
+        tr_text = re.sub(r"\s+", " ", tr_text).strip()
+
+        # ¿Aparece la cédula como palabra exacta en esta fila?
+        if not cedula_re.search(tr_text):
+            continue
+
+        encontrado_alguna_fila = True
+        tr_upper = tr_text.upper()
+
+        # Priorizar SOSPECHOSO (palabra entera con boundaries)
+        for rol in _ROLES_SOSPECHOSO:
+            if re.search(rf'\b{re.escape(rol)}\b', tr_upper):
+                # Si encontramos sospechoso → ya gana (es el peor caso)
+                return rol
+
+        # Si no es sospechoso, registrar primer rol neutro encontrado
+        if rol_mas_grave is None:
+            for rol in _ROLES_NEUTROS:
+                if re.search(rf'\b{re.escape(rol)}\b', tr_upper):
+                    rol_mas_grave = rol
+                    break
+
+    if rol_mas_grave is not None:
+        return rol_mas_grave
+
+    if encontrado_alguna_fila:
+        # Cédula está en una fila pero no se reconoce el rol
+        # NUNCA default a SOSPECHOSO (era el bug viejo) - usar DESCONOCIDO
+        logger.warning(f"[FISCALIA] Rol DESCONOCIDO para cedula {cedula}")
+        return "DESCONOCIDO"
+
+    return None
 
 
 def _vacio(error: str | None = None) -> dict:
