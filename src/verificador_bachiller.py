@@ -1,7 +1,21 @@
 import os
 import base64
+import threading
 import httpx
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+# ── Concurrencia segura de sync_playwright ─────────────────────────────────
+# sync_playwright NO es thread-safe — múltiples threads haciendo
+# sync_playwright().start() simultáneamente crean race condition al
+# spawnear el subproceso Node.js del driver Playwright. Resultado:
+# excepciones intermitentes en lotes grandes -> 88% ERROR en batch de 225.
+#
+# Fix: semáforo que limita a N consultas Bachiller concurrentes. N=2 por
+# default es seguro (2 procesos Chromium tibios cabe en RAM y no race).
+# Configurable con BACHILLER_CONCURRENCY env var.
+_BACHILLER_SEMAPHORE = threading.Semaphore(
+    int(os.getenv("BACHILLER_CONCURRENCY", "2"))
+)
 
 MINISTERIO_URL = (
     "https://servicios.educacion.gob.ec"
@@ -288,7 +302,16 @@ def consultar_cedula(cedula: str, max_intentos: int = 4) -> dict:
         · Segundo intento también NO_ENCONTRADO → confirmado sin título.
         · Segundo intento ENCONTRADO → el primero fue falso negativo (captcha malo
           que el servidor procesó sin dar error explícito).
+
+    Thread-safety: el semáforo BACHILLER_SEMAPHORE limita la concurrencia
+    para evitar el race condition de sync_playwright().
     """
+    with _BACHILLER_SEMAPHORE:
+        return _consultar_cedula_impl(cedula, max_intentos)
+
+
+def _consultar_cedula_impl(cedula: str, max_intentos: int = 4) -> dict:
+    """Implementación interna (no thread-safe — protegida por el semáforo arriba)."""
     # Proxy residencial opcional (para VPS con IP de datacenter bloqueada)
     proxy_url = os.getenv("WEBSHARE_PROXY_URL")  # ej: http://user:pass@host:port
     if proxy_url:
