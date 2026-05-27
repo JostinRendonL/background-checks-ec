@@ -312,20 +312,33 @@ def consultar_cedula(cedula: str, max_intentos: int = 4) -> dict:
 
 def _consultar_cedula_impl(cedula: str, max_intentos: int = 4) -> dict:
     """Implementación interna (no thread-safe — protegida por el semáforo arriba)."""
-    # Proxy residencial opcional (para VPS con IP de datacenter bloqueada)
-    proxy_url = os.getenv("WEBSHARE_PROXY_URL")  # ej: http://user:pass@host:port
-    if proxy_url:
-        from urllib.parse import urlparse
-        _p = urlparse(proxy_url)
-        proxy_cfg = {
-            "server":   f"{_p.scheme}://{_p.hostname}:{_p.port}",
-            "username": _p.username,
-            "password": _p.password,
-        }
-        print(f"[verificador] Usando proxy: {_p.hostname}:{_p.port} user={_p.username}")
+    # Proxy residencial opcional (para VPS con IP de datacenter bloqueada).
+    # Orden de preferencia:
+    #   1. BACHILLER_PROXY_URL/USER/PASS (formato separado, como Fiscalia)
+    #   2. WEBSHARE_PROXY_URL (legacy, URL con auth inline)
+    bach_url  = os.getenv("BACHILLER_PROXY_URL", "").strip()
+    bach_user = os.getenv("BACHILLER_PROXY_USER", "").strip()
+    bach_pass = os.getenv("BACHILLER_PROXY_PASS", "").strip()
+    if bach_url:
+        proxy_cfg = {"server": bach_url}
+        if bach_user: proxy_cfg["username"] = bach_user
+        if bach_pass: proxy_cfg["password"] = bach_pass
+        print(f"[verificador] Usando proxy: {bach_url} user={bach_user[:20] if bach_user else '(sin user)'}")
     else:
-        proxy_cfg = None
-        print("[verificador] Sin proxy — conectando directo")
+        # Fallback al formato viejo WEBSHARE_PROXY_URL
+        proxy_url_old = os.getenv("WEBSHARE_PROXY_URL", "").strip()
+        if proxy_url_old:
+            from urllib.parse import urlparse
+            _p = urlparse(proxy_url_old)
+            proxy_cfg = {
+                "server":   f"{_p.scheme}://{_p.hostname}:{_p.port}",
+                "username": _p.username,
+                "password": _p.password,
+            }
+            print(f"[verificador] Usando proxy legacy WEBSHARE: {_p.hostname}:{_p.port}")
+        else:
+            proxy_cfg = None
+            print("[verificador] Sin proxy — conectando directo")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
