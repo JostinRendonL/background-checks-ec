@@ -351,10 +351,11 @@ async def _parsear_resultados(cedula: str, page) -> dict:
     if not numeros:
         return _vacio()
 
-    noticias        = []
-    como_sospechoso = 0
+    noticias         = []
+    como_sospechoso  = 0
     como_denunciante = 0
-    delitos         = []
+    delitos          = []
+    nombre_persona   = ""
 
     for num in numeros:
         idx = html.find(num)
@@ -364,6 +365,10 @@ async def _parsear_resultados(cedula: str, page) -> dict:
         rol = _buscar_rol_cedula(cedula, bloque)
         if rol is None:
             continue
+
+        # Extraer nombre una sola vez (primera noticia donde aparece la cédula)
+        if not nombre_persona:
+            nombre_persona = _buscar_nombre_cedula(cedula, bloque)
 
         noticia = _parsear_bloque(num, bloque)
         noticia["rol"] = rol
@@ -381,6 +386,7 @@ async def _parsear_resultados(cedula: str, page) -> dict:
 
     return {
         "error":              None,
+        "nombre":             nombre_persona,
         "tiene_antecedentes": como_sospechoso > 0,
         "noticias":           noticias,
         "como_sospechoso":    como_sospechoso,
@@ -417,6 +423,60 @@ def _parsear_bloque(numero: str, bloque: str) -> dict:
         lugar = ""
 
     return {"numero": numero, "fecha": fecha, "delito": delito, "lugar": lugar, "rol": ""}
+
+
+def _buscar_nombre_cedula(cedula: str, bloque_html: str) -> str:
+    """
+    Extrae el nombre de la persona cuya cédula aparece en la tabla de sujetos.
+
+    Estrategia 1 — columnas <td>:
+      La fila <tr> contiene celdas [cédula, nombre, rol, ...].
+      Si la cédula está en una celda, el nombre está en la siguiente.
+
+    Estrategia 2 — texto plano:
+      Tras la cédula y antes del primer rol conocido, los tokens son el nombre.
+    """
+    tr_pattern = re.compile(r'<tr\b[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
+    td_pattern = re.compile(r'<td\b[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+    cedula_re = re.compile(rf'(?<!\d){re.escape(cedula)}(?!\d)')
+    todos_roles = _ROLES_SOSPECHOSO | _ROLES_NEUTROS
+
+    for tr_match in tr_pattern.finditer(bloque_html):
+        tr_content = tr_match.group(1)
+        tr_text = re.sub(r"<[^>]+>", " ", tr_content)
+        tr_text = re.sub(r"\s+", " ", tr_text).strip()
+        if not cedula_re.search(tr_text):
+            continue
+
+        # Estrategia 1: celda adyacente a la que contiene la cédula
+        tds = td_pattern.findall(tr_content)
+        for i, td in enumerate(tds):
+            td_text = re.sub(r"<[^>]+>", " ", td)
+            td_text = re.sub(r"\s+", " ", td_text).strip()
+            if cedula_re.search(td_text):
+                if i + 1 < len(tds):
+                    nombre_raw = re.sub(r"<[^>]+>", " ", tds[i + 1])
+                    nombre_raw = re.sub(r"\s+", " ", nombre_raw).strip()
+                    if nombre_raw and nombre_raw.upper() not in todos_roles and len(nombre_raw) > 3:
+                        return nombre_raw
+                break
+
+        # Estrategia 2: tokens entre cédula y el primer rol en texto plano
+        partes = cedula_re.split(tr_text, maxsplit=1)
+        if len(partes) > 1:
+            tokens = partes[1].strip().split()
+            nombre_tokens = []
+            for tok in tokens:
+                if tok.upper() in todos_roles:
+                    break
+                nombre_tokens.append(tok)
+            nombre = " ".join(nombre_tokens).strip(" ,;-")
+            if len(nombre) > 3:
+                return nombre
+
+        break  # Solo la primera fila con la cédula
+
+    return ""
 
 
 def _buscar_rol_cedula(cedula: str, bloque_html: str) -> str | None:
@@ -481,6 +541,7 @@ def _buscar_rol_cedula(cedula: str, bloque_html: str) -> str | None:
 def _vacio(error: str | None = None) -> dict:
     return {
         "error":              error,
+        "nombre":             "",
         "tiene_antecedentes": False,
         "noticias":           [],
         "como_sospechoso":    0,
