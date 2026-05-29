@@ -98,6 +98,7 @@ async def verificar_api_key(key: str = Security(api_key_header)):
 # ── Modelos ───────────────────────────────────────────────────────────────────
 class ConsultaRequest(BaseModel):
     cedula: str = Field(..., description="Cédula ecuatoriana de 10 dígitos", example="0912345675")
+    force_refresh: bool = Field(False, description="Si True, ignora el caché Redis y consulta las fuentes directamente")
 
 class BatchRequest(BaseModel):
     cedulas: list[str] = Field(..., description=f"Lista de cédulas (máx {MAX_BATCH})", max_length=MAX_BATCH)
@@ -164,18 +165,20 @@ async def health(deep: bool = False):
     return {**base, "status": overall, "deps": deps}
 
 
-async def _consultar_con_cache(tipo: str, cedula: str, ejecutar_fn) -> dict:
+async def _consultar_con_cache(tipo: str, cedula: str, ejecutar_fn, force_refresh: bool = False) -> dict:
     """
     Helper genérico: chequea cache Redis → si hit devuelve. Si miss ejecuta
     la función real (con semaphore), guarda en cache, y devuelve.
     `ejecutar_fn` es una coroutine async sin args que hace el trabajo real.
+    `force_refresh=True` salta el cache y fuerza scraping fresco.
     """
-    # 1. Probar cache
-    cached = await cache_get(tipo, cedula)
-    if cached is not None:
-        cached["_cache_hit"] = True
-        cached["tiempo_seg"] = 0.0
-        return cached
+    # 1. Probar cache (saltar si force_refresh)
+    if not force_refresh:
+        cached = await cache_get(tipo, cedula)
+        if cached is not None:
+            cached["_cache_hit"] = True
+            cached["tiempo_seg"] = 0.0
+            return cached
 
     # 2. Cache miss → ejecutar el scraper real
     t0 = time.time()
@@ -198,6 +201,7 @@ async def consultar_bachiller_ep(req: ConsultaRequest):
     return await _consultar_con_cache(
         "bachiller", cedula,
         lambda: asyncio.to_thread(verificar_bachiller, cedula),
+        force_refresh=req.force_refresh,
     )
 
 
@@ -210,6 +214,7 @@ async def consultar_satje_ep(req: ConsultaRequest):
     return await _consultar_con_cache(
         "satje", cedula,
         lambda: consultar_satje(cedula),
+        force_refresh=req.force_refresh,
     )
 
 
@@ -222,6 +227,7 @@ async def consultar_setec_ep(req: ConsultaRequest):
     return await _consultar_con_cache(
         "setec", cedula,
         lambda: consultar_setec(cedula),
+        force_refresh=req.force_refresh,
     )
 
 
@@ -235,7 +241,7 @@ async def consultar_completo_ep(req: ConsultaRequest):
     """
     cedula = req.cedula.strip()
     _validar_cedula(cedula)
-    logger.info(f"[API] /completo → {cedula}")
+    logger.info(f"[API] /completo → {cedula} (force_refresh={req.force_refresh})")
     t0 = time.time()
 
     # Wrapper: cache hit o ejecuta el scraper para cada uno
@@ -243,12 +249,14 @@ async def consultar_completo_ep(req: ConsultaRequest):
         return await _consultar_con_cache(
             "bachiller", cedula,
             lambda: asyncio.to_thread(verificar_bachiller, cedula),
+            force_refresh=req.force_refresh,
         )
 
     async def get_satje():
         return await _consultar_con_cache(
             "satje", cedula,
             lambda: consultar_satje(cedula),
+            force_refresh=req.force_refresh,
         )
 
     resultados = await asyncio.gather(
@@ -282,6 +290,7 @@ async def consultar_fiscalia_ep(req: ConsultaRequest):
     return await _consultar_con_cache(
         "fiscalia", cedula,
         lambda: consultar_fiscalia(cedula),
+        force_refresh=req.force_refresh,
     )
 
 
