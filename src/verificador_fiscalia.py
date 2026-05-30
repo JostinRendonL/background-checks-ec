@@ -139,12 +139,21 @@ def _cargar_pool_proxies() -> list[dict]:
     return pool
 
 
-# Cargar el pool una sola vez al iniciar
-_PROXY_POOL: list[dict] = _cargar_pool_proxies()
-if _PROXY_POOL:
-    logger.info(f"[FISCALIA] ✓ Pool de proxies cargado: {len(_PROXY_POOL)} IPs disponibles para rotacion")
-else:
-    logger.info(f"[FISCALIA] Pool vacio. Usara FISCALIA_PROXY_URL='{_PROXY_URL or '(none)'}' como fallback.")
+# Pool lazy: se carga en la primera llamada (cuando logging ya esta configurado).
+# Si lo cargamos a nivel de modulo, los logs.info() se pierden porque
+# api/main.py hace el import ANTES de logging.basicConfig().
+_PROXY_POOL: list[dict] | None = None  # None = no inicializado todavia
+
+def _obtener_pool() -> list[dict]:
+    """Devuelve el pool. Lo carga la primera vez (lazy)."""
+    global _PROXY_POOL
+    if _PROXY_POOL is None:
+        _PROXY_POOL = _cargar_pool_proxies()
+        if _PROXY_POOL:
+            logger.info(f"[FISCALIA] ✓ Pool de proxies cargado: {len(_PROXY_POOL)} IPs disponibles para rotacion")
+        else:
+            logger.info(f"[FISCALIA] Pool vacio. Usara FISCALIA_PROXY_URL='{_PROXY_URL or '(none)'}' como fallback.")
+    return _PROXY_POOL
 
 
 def _build_proxy_cfg(excluir: list[str] | None = None) -> dict | None:
@@ -155,11 +164,12 @@ def _build_proxy_cfg(excluir: list[str] | None = None) -> dict | None:
     """
     excluir = excluir or []
     # Pool tiene prioridad
-    if _PROXY_POOL:
-        candidatos = [p for p in _PROXY_POOL if p["server"] not in excluir]
+    pool = _obtener_pool()
+    if pool:
+        candidatos = [p for p in pool if p["server"] not in excluir]
         if not candidatos:
             # Todos los del pool fallaron en este intento — reusar random
-            candidatos = _PROXY_POOL
+            candidatos = pool
         return random.choice(candidatos)
     # Fallback al proxy unico
     if not _PROXY_URL:
@@ -253,8 +263,9 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
         proxy_cfg = _build_proxy_cfg()
         max_intentos = _MAX_INTENTOS
         if proxy_cfg:
-            if _PROXY_POOL:
-                logger.info(f"[FISCALIA] Modo: Pool de {len(_PROXY_POOL)} proxies residenciales (rotacion automatica)")
+            _p = _obtener_pool()
+            if _p:
+                logger.info(f"[FISCALIA] Modo: Pool de {len(_p)} proxies residenciales (rotacion automatica)")
             else:
                 logger.info(f"[FISCALIA] Modo: Proxy residencial unico -> {proxy_cfg['server']}")
         else:
@@ -263,8 +274,10 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
     ultimo_error = "sin intentos"
     # Si hay pool, podemos hacer hasta N intentos = tamano del pool (cada uno IP distinta).
     # Si no hay pool, usamos max_intentos default (mismo IP en cada intento, menos util).
-    if not usando_browser_api and _PROXY_POOL:
-        max_intentos = min(len(_PROXY_POOL), 5)  # tope 5 para no esperar 50s
+    if not usando_browser_api:
+        _p = _obtener_pool()
+        if _p:
+            max_intentos = min(len(_p), 5)  # tope 5 para no esperar 50s
     proxies_usados: list[str] = []  # tracker de servers para excluir en reintentos
 
     for intento in range(1, max_intentos + 1):
