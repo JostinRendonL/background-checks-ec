@@ -84,9 +84,72 @@ _PROXY_URL  = os.getenv("FISCALIA_PROXY_URL", "").strip()
 _PROXY_USER = os.getenv("FISCALIA_PROXY_USER", "").strip()
 _PROXY_PASS = os.getenv("FISCALIA_PROXY_PASS", "").strip()
 
+# ── Pool de proxies (rotacion entre reintentos) ──────────────────────────────
+# Soporta 2 formas de configurar (ambas opcionales — fallback al proxy unico):
+#   1) FISCALIA_PROXY_LIST_FILE = /app/proxies.csv
+#      Una linea por proxy: host:port:user:pass
+#   2) FISCALIA_PROXY_LIST = "host1:port:user:pass,host2:port:user:pass,..."
+#      Comma-separated en el mismo formato.
+#
+# En cada llamada se elige un proxy al azar; si falla, el siguiente intento
+# excluye el ya usado (asi 10 proxies = 10 IPs distintas en reintentos).
 
-def _build_proxy_cfg() -> dict | None:
-    """Construye el dict de proxy para Playwright si las env vars estan seteadas."""
+import random
+_PROXY_LIST_FILE = os.getenv("FISCALIA_PROXY_LIST_FILE", "").strip()
+_PROXY_LIST_ENV  = os.getenv("FISCALIA_PROXY_LIST", "").strip()
+
+
+def _cargar_pool_proxies() -> list[dict]:
+    """Carga el pool de proxies desde archivo o env var. Cada proxy es un dict
+    {server, username, password} listo para Playwright."""
+    raw_lines: list[str] = []
+    if _PROXY_LIST_FILE and os.path.exists(_PROXY_LIST_FILE):
+        try:
+            with open(_PROXY_LIST_FILE, "r", encoding="utf-8") as f:
+                raw_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        except Exception as e:
+            logger.warning(f"[FISCALIA] no se pudo leer {_PROXY_LIST_FILE}: {e}")
+    elif _PROXY_LIST_ENV:
+        raw_lines = [s.strip() for s in _PROXY_LIST_ENV.split(",") if s.strip()]
+
+    pool = []
+    for line in raw_lines:
+        # Formato: host:port:user:pass
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        host, port = parts[0], parts[1]
+        user = parts[2] if len(parts) > 2 else ""
+        # Pass puede contener ':' (como '4j0Ux=3d1HkvmyUUxx'), unimos los restantes
+        passw = ":".join(parts[3:]) if len(parts) > 3 else ""
+        cfg = {"server": f"http://{host}:{port}"}
+        if user:  cfg["username"] = user
+        if passw: cfg["password"] = passw
+        pool.append(cfg)
+    return pool
+
+
+# Cargar el pool una sola vez al iniciar
+_PROXY_POOL: list[dict] = _cargar_pool_proxies()
+if _PROXY_POOL:
+    logger.info(f"[FISCALIA] Pool de proxies cargado: {len(_PROXY_POOL)} IPs disponibles para rotacion")
+
+
+def _build_proxy_cfg(excluir: list[str] | None = None) -> dict | None:
+    """Devuelve un proxy para Playwright.
+    - Si hay POOL: elige uno random, excluyendo los servers ya intentados.
+    - Si no hay POOL pero hay FISCALIA_PROXY_URL: usa ese (modo viejo).
+    - Si nada esta configurado: None (directo, solo dev local).
+    """
+    excluir = excluir or []
+    # Pool tiene prioridad
+    if _PROXY_POOL:
+        candidatos = [p for p in _PROXY_POOL if p["server"] not in excluir]
+        if not candidatos:
+            # Todos los del pool fallaron en este intento — reusar random
+            candidatos = _PROXY_POOL
+        return random.choice(candidatos)
+    # Fallback al proxy unico
     if not _PROXY_URL:
         return None
     cfg: dict[str, str] = {"server": _PROXY_URL}
@@ -178,18 +241,33 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
         proxy_cfg = _build_proxy_cfg()
         max_intentos = _MAX_INTENTOS
         if proxy_cfg:
-            logger.info(f"[FISCALIA] Modo: Proxy residencial -> {proxy_cfg['server']}")
+            if _PROXY_POOL:
+                logger.info(f"[FISCALIA] Modo: Pool de {len(_PROXY_POOL)} proxies residenciales (rotacion automatica)")
+            else:
+                logger.info(f"[FISCALIA] Modo: Proxy residencial unico -> {proxy_cfg['server']}")
         else:
             logger.info(f"[FISCALIA] Modo: directo (sin proxy)")
 
     ultimo_error = "sin intentos"
+    # Si hay pool, podemos hacer hasta N intentos = tamano del pool (cada uno IP distinta).
+    # Si no hay pool, usamos max_intentos default (mismo IP en cada intento, menos util).
+    if not usando_browser_api and _PROXY_POOL:
+        max_intentos = min(len(_PROXY_POOL), 5)  # tope 5 para no esperar 50s
+    proxies_usados: list[str] = []  # tracker de servers para excluir en reintentos
+
     for intento in range(1, max_intentos + 1):
-        logger.info(f"[FISCALIA] Intento {intento}/{max_intentos}")
         try:
             if usando_browser_api:
+                logger.info(f"[FISCALIA] Intento {intento}/{max_intentos}")
                 result = await _intentar_browser_api(cedula)
             else:
-                result = await _intentar_proxy(cedula, _build_proxy_cfg())
+                proxy_cfg = _build_proxy_cfg(excluir=proxies_usados)
+                if proxy_cfg:
+                    proxies_usados.append(proxy_cfg["server"])
+                    logger.info(f"[FISCALIA] Intento {intento}/{max_intentos} via {proxy_cfg['server']}")
+                else:
+                    logger.info(f"[FISCALIA] Intento {intento}/{max_intentos} (sin proxy)")
+                result = await _intentar_proxy(cedula, proxy_cfg)
         except Exception as exc:
             logger.error(f"[FISCALIA] Intento {intento} excepcion: {exc}")
             result = _vacio(error=str(exc)[:200])

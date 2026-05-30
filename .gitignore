@@ -38,3 +38,8 @@ logs/
 # Builds
 dist/
 build/
+
+# Proxies con credenciales — NO commitear
+proxies.csv
+proxies.txt
+*.proxies
