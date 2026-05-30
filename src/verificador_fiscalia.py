@@ -277,7 +277,12 @@ async def consultar_fiscalia(cedula: str) -> dict[str, Any]:
     if not usando_browser_api:
         _p = _obtener_pool()
         if _p:
-            max_intentos = min(len(_p), 5)  # tope 5 para no esperar 50s
+            # Con pool de 1 (rotating proxy → IP nueva cada request) usar MAX_INTENTOS normal (3)
+            # Con pool de varios (sticky → IPs distintas por puerto) usar tope 5
+            if len(_p) == 1:
+                max_intentos = _MAX_INTENTOS  # 3 reintentos contra el mismo endpoint rotativo
+            else:
+                max_intentos = min(len(_p), 5)
     proxies_usados: list[str] = []  # tracker de servers para excluir en reintentos
 
     for intento in range(1, max_intentos + 1):
