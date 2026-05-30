@@ -101,26 +101,36 @@ _PROXY_LIST_ENV  = os.getenv("FISCALIA_PROXY_LIST", "").strip()
 
 def _cargar_pool_proxies() -> list[dict]:
     """Carga el pool de proxies desde archivo o env var. Cada proxy es un dict
-    {server, username, password} listo para Playwright."""
+    {server, username, password} listo para Playwright. Log verbose para debug."""
+    logger.info(f"[FISCALIA] Cargando pool de proxies...")
+    logger.info(f"[FISCALIA]   FISCALIA_PROXY_LIST_FILE = '{_PROXY_LIST_FILE}'")
+    logger.info(f"[FISCALIA]   FISCALIA_PROXY_LIST      = {'(set, ' + str(len(_PROXY_LIST_ENV)) + ' chars)' if _PROXY_LIST_ENV else '(not set)'}")
+
     raw_lines: list[str] = []
-    if _PROXY_LIST_FILE and os.path.exists(_PROXY_LIST_FILE):
-        try:
-            with open(_PROXY_LIST_FILE, "r", encoding="utf-8") as f:
-                raw_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        except Exception as e:
-            logger.warning(f"[FISCALIA] no se pudo leer {_PROXY_LIST_FILE}: {e}")
+    if _PROXY_LIST_FILE:
+        if os.path.exists(_PROXY_LIST_FILE):
+            try:
+                with open(_PROXY_LIST_FILE, "r", encoding="utf-8") as f:
+                    raw_lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                logger.info(f"[FISCALIA]   Archivo leido: {_PROXY_LIST_FILE} ({len(raw_lines)} lineas)")
+            except Exception as e:
+                logger.error(f"[FISCALIA]   ERROR leyendo {_PROXY_LIST_FILE}: {e}")
+        else:
+            logger.warning(f"[FISCALIA]   ARCHIVO NO EXISTE: {_PROXY_LIST_FILE}")
     elif _PROXY_LIST_ENV:
         raw_lines = [s.strip() for s in _PROXY_LIST_ENV.split(",") if s.strip()]
+        logger.info(f"[FISCALIA]   Lista cargada de env var ({len(raw_lines)} entradas)")
+    else:
+        logger.info(f"[FISCALIA]   Ninguna fuente de pool configurada — usando FISCALIA_PROXY_URL si existe")
 
     pool = []
     for line in raw_lines:
-        # Formato: host:port:user:pass
         parts = line.split(":")
         if len(parts) < 2:
+            logger.warning(f"[FISCALIA]   Linea invalida (necesita host:port[:user:pass]): {line[:30]}...")
             continue
         host, port = parts[0], parts[1]
         user = parts[2] if len(parts) > 2 else ""
-        # Pass puede contener ':' (como '4j0Ux=3d1HkvmyUUxx'), unimos los restantes
         passw = ":".join(parts[3:]) if len(parts) > 3 else ""
         cfg = {"server": f"http://{host}:{port}"}
         if user:  cfg["username"] = user
@@ -132,7 +142,9 @@ def _cargar_pool_proxies() -> list[dict]:
 # Cargar el pool una sola vez al iniciar
 _PROXY_POOL: list[dict] = _cargar_pool_proxies()
 if _PROXY_POOL:
-    logger.info(f"[FISCALIA] Pool de proxies cargado: {len(_PROXY_POOL)} IPs disponibles para rotacion")
+    logger.info(f"[FISCALIA] ✓ Pool de proxies cargado: {len(_PROXY_POOL)} IPs disponibles para rotacion")
+else:
+    logger.info(f"[FISCALIA] Pool vacio. Usara FISCALIA_PROXY_URL='{_PROXY_URL or '(none)'}' como fallback.")
 
 
 def _build_proxy_cfg(excluir: list[str] | None = None) -> dict | None:
