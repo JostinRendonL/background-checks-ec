@@ -22,6 +22,7 @@ import os
 import re
 from typing import Any
 
+import httpx
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 try:
@@ -180,6 +181,113 @@ def _build_proxy_cfg(excluir: list[str] | None = None) -> dict | None:
     if _PROXY_PASS:
         cfg["password"] = _PROXY_PASS
     return cfg
+
+
+# ── 2captcha — resolver hCaptcha del portal de Fiscalia ─────────────────
+# El portal cuando detecta IP "sospechosa" sirve un hCaptcha (CAPTCHA visual).
+# 2captcha lo resuelve por ~$0.0025 por captcha (humanos reales).
+_TWOCAPTCHA_KEY = os.getenv("TWOCAPTCHA_API_KEY", "").strip()
+
+
+async def _resolver_hcaptcha(sitekey: str, page_url: str) -> str | None:
+    """Resuelve un hCaptcha via 2captcha. Devuelve el token o None si falla.
+    Tiempo tipico: 15-45 segundos (humanos resolviendo)."""
+    if not _TWOCAPTCHA_KEY:
+        logger.warning("[FISCALIA] hCaptcha detectado pero TWOCAPTCHA_API_KEY no configurada")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            # 1) Enviar tarea
+            r = await client.post(
+                "https://2captcha.com/in.php",
+                data={
+                    "key":     _TWOCAPTCHA_KEY,
+                    "method":  "hcaptcha",
+                    "sitekey": sitekey,
+                    "pageurl": page_url,
+                    "json":    "1",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") != 1:
+                logger.warning(f"[FISCALIA] 2captcha rechazo el envio: {data.get('request')}")
+                return None
+            task_id = data["request"]
+            logger.info(f"[FISCALIA] hCaptcha enviado a 2captcha (task {task_id}), esperando...")
+
+            # 2) Polling (max 90s, cada 5s)
+            for intento in range(18):
+                await asyncio.sleep(5)
+                r2 = await client.get(
+                    "https://2captcha.com/res.php",
+                    params={"key": _TWOCAPTCHA_KEY, "action": "get",
+                            "id": task_id, "json": "1"},
+                )
+                r2.raise_for_status()
+                d2 = r2.json()
+                if d2.get("status") == 1:
+                    token = (d2.get("request") or "").strip()
+                    logger.info(f"[FISCALIA] hCaptcha resuelto en {(intento+1)*5}s "
+                                f"(token len={len(token)})")
+                    return token
+                req = d2.get("request", "")
+                if req != "CAPCHA_NOT_READY":
+                    logger.warning(f"[FISCALIA] 2captcha error: {req}")
+                    return None
+            logger.warning("[FISCALIA] 2captcha timeout (90s)")
+            return None
+    except Exception as e:
+        logger.warning(f"[FISCALIA] _resolver_hcaptcha fallo: {e}")
+        return None
+
+
+async def _detectar_y_resolver_hcaptcha(page) -> bool:
+    """Inspecciona la pagina; si hay hCaptcha, lo resuelve via 2captcha
+    e inyecta el token. Devuelve True si resolvio (o no habia captcha)."""
+    try:
+        # Buscar el iframe/div del hCaptcha y extraer sitekey
+        sitekey = await page.evaluate("""() => {
+            // Buscar en multiples lugares donde puede estar el sitekey
+            const el1 = document.querySelector('[data-sitekey]');
+            if (el1) return el1.getAttribute('data-sitekey');
+            const iframe = document.querySelector('iframe[src*="hcaptcha.com"]');
+            if (iframe) {
+                const m = iframe.src.match(/sitekey=([\\w-]+)/);
+                if (m) return m[1];
+            }
+            return null;
+        }""")
+        if not sitekey:
+            return True  # no hay captcha visible
+        logger.info(f"[FISCALIA] hCaptcha detectado (sitekey={sitekey[:8]}...)")
+        page_url = page.url
+        token = await _resolver_hcaptcha(sitekey, page_url)
+        if not token:
+            return False
+        # Inyectar el token: textarea de h-captcha-response + dispatch event
+        await page.evaluate(f"""(token) => {{
+            const ta = document.querySelector('[name="h-captcha-response"]')
+                    || document.querySelector('textarea[name="h-captcha-response"]');
+            if (ta) {{ ta.value = token; ta.innerHTML = token; }}
+            // A veces tambien hay un g-recaptcha-response shim
+            const ga = document.querySelector('[name="g-recaptcha-response"]');
+            if (ga) {{ ga.value = token; ga.innerHTML = token; }}
+            // Disparar callback de hCaptcha si existe
+            try {{
+                if (window.hcaptcha && typeof window.hcaptcha.execute === 'function') {{
+                    // nada, ya tenemos token
+                }}
+                // Algunos sitios escuchan submit del form despues del token
+            }} catch(e) {{}}
+        }}""", token)
+        logger.info("[FISCALIA] Token de hCaptcha inyectado en DOM")
+        await asyncio.sleep(1)
+        return True
+    except Exception as e:
+        logger.warning(f"[FISCALIA] _detectar_y_resolver_hcaptcha fallo: {e}")
+        return False
+
 
 _STEALTH_JS = """
     // ── navigator props ─────────────────────────────────────────────
@@ -420,24 +528,54 @@ async def _consultar_en_page(cedula: str, page) -> dict:
     except PWTimeout:
         logger.info("[FISCALIA] #pwd no aparecio, intentando reload post-challenge")
 
-    # Paso 3: si no apareció, probablemente estamos en el iframe de Incapsula
-    # Damos tiempo extra al JS del challenge para completar, luego reload
+    # Paso 3: si no apareció, puede ser: (a) Incapsula JS challenge en proceso,
+    # o (b) hCaptcha esperando resolucion. Damos tiempo JS y verificamos.
     if not pwd_visible:
         await asyncio.sleep(4)   # tiempo para que Incapsula JS termine
+
+        # Antes del reload, ver si la pagina muestra hCaptcha y resolverlo
         try:
-            await page.reload(wait_until="commit", timeout=_TIMEOUT_NAV)
-            await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_RELOAD)
-            pwd_visible = True
-            logger.info("[FISCALIA] #pwd aparecio post-reload")
-        except PWTimeout:
-            # Capturar HTML para debug
+            body = await page.content()
+            has_hcaptcha = "hcaptcha" in body.lower() or "h-captcha" in body.lower()
+            if has_hcaptcha and _TWOCAPTCHA_KEY:
+                logger.info("[FISCALIA] Detectado hCaptcha, intentando resolver via 2captcha")
+                resolvio = await _detectar_y_resolver_hcaptcha(page)
+                if resolvio:
+                    # Despues de inyectar el token, esperar a que aparezca #pwd
+                    try:
+                        await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_RELOAD)
+                        pwd_visible = True
+                        logger.info("[FISCALIA] #pwd aparecio post-hCaptcha resuelto")
+                    except PWTimeout:
+                        # A veces necesita un submit/click adicional o un reload para aplicar el token
+                        try:
+                            await page.reload(wait_until="commit", timeout=_TIMEOUT_NAV)
+                            await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_RELOAD)
+                            pwd_visible = True
+                            logger.info("[FISCALIA] #pwd aparecio post-hCaptcha+reload")
+                        except PWTimeout:
+                            pass
+        except Exception as e:
+            logger.warning(f"[FISCALIA] check hCaptcha fallo: {e}")
+
+        # Si todavia no aparecio, intentar reload tradicional (Incapsula JS challenge)
+        if not pwd_visible:
             try:
-                body = await page.content()
-                has_incap = "incapsula" in body.lower() or "_incap_" in body.lower()
-                logger.warning(f"[FISCALIA] tras reload, #pwd no aparece. incapsula_en_body={has_incap}")
-            except Exception:
-                pass
-            return _vacio(error="Incapsula challenge no se resolvio (bot detection persistente)")
+                await page.reload(wait_until="commit", timeout=_TIMEOUT_NAV)
+                await page.wait_for_selector("#pwd", state="visible", timeout=_TIMEOUT_PWD_RELOAD)
+                pwd_visible = True
+                logger.info("[FISCALIA] #pwd aparecio post-reload")
+            except PWTimeout:
+                # Capturar HTML para debug
+                try:
+                    body = await page.content()
+                    has_incap = "incapsula" in body.lower() or "_incap_" in body.lower()
+                    has_hcap  = "hcaptcha" in body.lower()
+                    msg_detalle = "hCaptcha sin resolver" if has_hcap else "Incapsula challenge"
+                    logger.warning(f"[FISCALIA] tras reload, #pwd no aparece. incap={has_incap} hcap={has_hcap}")
+                except Exception:
+                    msg_detalle = "challenge persistente"
+                return _vacio(error=f"{msg_detalle} no se resolvio (bot detection persistente)")
 
     # Paso 4: llenar y submit
     await page.fill("#pwd", cedula)
