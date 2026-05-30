@@ -35,13 +35,16 @@ import asyncio
 import logging
 from typing import Any
 
-from playwright.async_api import async_playwright, Browser, Playwright
+from playwright.async_api import async_playwright as _pw_default, Browser, Playwright
 
 logger = logging.getLogger(__name__)
 
 
 class BrowserPool:
-    """Pool de browsers Chromium async con auto-recycling."""
+    """Pool de browsers Chromium async con auto-recycling.
+
+    Por default usa playwright. Para Fiscalia (que necesita mejor stealth
+    contra Imperva), pasar `pw_factory=patchright.async_playwright`."""
 
     def __init__(
         self,
@@ -49,11 +52,13 @@ class BrowserPool:
         launch_kwargs: dict[str, Any] | None = None,
         max_uses_per_browser: int = 50,
         name: str = "default",
+        pw_factory=None,
     ):
         self._size = size
         self._launch_kwargs = launch_kwargs or {"headless": True}
         self._max_uses = max_uses_per_browser
         self._name = name
+        self._pw_factory = pw_factory or _pw_default
 
         self._pw: Playwright | None = None
         self._queue: asyncio.Queue[Browser] | None = None
@@ -67,8 +72,9 @@ class BrowserPool:
             if self._initialized:
                 return
 
-            logger.info(f"[POOL:{self._name}] Iniciando pool de {self._size} browsers...")
-            self._pw = await async_playwright().start()
+            logger.info(f"[POOL:{self._name}] Iniciando pool de {self._size} browsers "
+                        f"({'patchright' if self._pw_factory is not _pw_default else 'playwright'})...")
+            self._pw = await self._pw_factory().start()
             self._queue = asyncio.Queue(maxsize=self._size)
 
             for i in range(self._size):

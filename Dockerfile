@@ -15,8 +15,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalar Chromium de Playwright
+# Instalar Chromium de Playwright (reusado por patchright tambien)
 RUN playwright install chromium --with-deps
+# Patchright = fork de Playwright con stealth fuerte. Reusa el mismo Chromium
+# pero con parchos anti-detection. Solo necesita el browser ya instalado.
+RUN patchright install chromium 2>/dev/null || true
 
 COPY . .
 

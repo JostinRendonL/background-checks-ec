@@ -23,7 +23,14 @@ import re
 from typing import Any
 
 import httpx
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+# Patchright (fork de Playwright con stealth fuerte built-in) — mejor contra Imperva
+# Si no esta instalado, fallback a playwright normal (API es identica)
+try:
+    from patchright.async_api import async_playwright, TimeoutError as PWTimeout
+    _USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    _USING_PATCHRIGHT = False
 
 try:
     from playwright_stealth import stealth_async
@@ -63,6 +70,8 @@ def get_fiscalia_pool() -> BrowserPool:
             launch_kwargs=launch_kwargs,
             max_uses_per_browser=25,   # rota IP de Decodo cada 25 usos
             name="fiscalia",
+            # Si patchright esta disponible, lo usamos para mejor stealth contra Imperva
+            pw_factory=(async_playwright if _USING_PATCHRIGHT else None),
         )
     return _fiscalia_pool
 
